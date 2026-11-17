@@ -24,7 +24,7 @@ machine first boots. That keeps the image small enough to build on a GitHub runn
 | --- | --- |
 | `audio` | The speech (mp3, wav or m4a, or a video file). The output is as long as the audio. |
 | `image` | Optional. Without it, the person is made from `prompt`, at `aspect_ratio`. |
-| `resolution` | `480p` (up to 75 s) or `720p` (up to 15 s). |
+| `resolution` | `480p` (up to 90 s) or `720p` (up to 15 s). |
 | `max_duration` | Longer audio is cut at this point. |
 | `isolate_voice` | Strips music or noise before lip-sync. The output keeps the original audio. |
 | `mix_steps`, `mix_alpha` | The LoRA mix. Leave these at the defaults unless faces distort. |

@@ -2,7 +2,8 @@
 # Run (or follow) a test prediction on Replicate and wait for it to finish.
 #   usage: scripts/smoke.sh [prediction_id]
 #   env:   REPLICATE_API_TOKEN (required), MODEL ("owner/name", needed to start one),
-#          VERSION (optional, defaults to the model's latest), WAIT_MINUTES (default 70)
+#          VERSION (optional, defaults to the model's latest), WAIT_MINUTES (default 70),
+#          SMOKE_SECONDS (max_duration, default 8; the demo speech is 82 s long)
 # Polling tolerates transient HTTP errors; a cold boot downloads ~63 GB of weights first.
 set -uo pipefail
 api=https://api.replicate.com/v1
@@ -14,13 +15,13 @@ if [ -z "$id" ]; then
   [ -n "$version" ] || version=$(curl --retry 5 --retry-all-errors --retry-delay 5 -s -H "$auth" "$api/models/${MODEL}" | jq -r '.latest_version.id // empty')
   [ -n "$version" ] || { echo "No version found for ${MODEL}"; exit 1; }
   assets="https://raw.githubusercontent.com/meituan-longcat/LongCat-Video/58eb336edc5c8c63389838727e40b8c18434e54e/assets/avatar/single"
-  body=$(jq -n --arg v "$version" --arg a "$assets" '{
+  body=$(jq -n --arg v "$version" --arg a "$assets" --arg d "${SMOKE_SECONDS:-8}" '{
     version: $v,
     input: {
       audio: ($a + "/man.mp3"),
       image: ($a + "/man.png"),
       prompt: "A man stands on stage under dramatic lighting, holding a microphone close to his mouth, speaking while smoke swirls around him.",
-      max_duration: 8,
+      max_duration: ($d | tonumber),
       seed: 42
     }
   }')

@@ -89,9 +89,10 @@ NEXT_SEGMENT_SECONDS = (NUM_FRAMES - NUM_COND_FRAMES) / FPS  # 3.2 s
 # Replicate stops a prediction at 30 min. Stop starting new segments in time to
 # finish the one in flight and encode, and return the video made so far.
 TIME_BUDGET_SECONDS = 26 * 60
-# Measured on one H100: 58.6 s per 480p segment (3.2 s of new video). 75 s of video is
-# 24 segments, about 23.5 min. 720p is NOT measured yet (estimated ~4x slower per segment).
-MAX_DURATION = {"480p": 75.0, "720p": 15.0}
+# Measured on one H100 with FlashAttention 3: ~50 s per 480p segment (3.2 s of new video;
+# 58.6 s with FA2), plus ~50 s of audio prep and encoding. 90 s of video is 28 segments,
+# about 25 min. 720p is NOT measured yet (estimated ~4x slower per segment).
+MAX_DURATION = {"480p": 90.0, "720p": 15.0}
 
 NEGATIVE_PROMPT = (
     "Close-up, Bright tones, overexposed, static, blurred details, subtitles, style, works, "
@@ -440,10 +441,10 @@ class Runner(BaseRunner):
             default="16:9",
         ),
         max_duration: float = Input(
-            description="Longest video to make, in seconds. Longer audio is cut. Limits: 75 s at 480p, 15 s at 720p (Replicate stops runs at 30 min).",
+            description="Longest video to make, in seconds. Longer audio is cut. Limits: 90 s at 480p, 15 s at 720p (Replicate stops runs at 30 min).",
             default=30.0,
             ge=1.0,
-            le=75.0,
+            le=90.0,
         ),
         isolate_voice: bool = Input(
             description="Strip music and background noise from the audio before driving the lips (the output keeps your original audio).",

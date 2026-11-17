@@ -20,9 +20,13 @@ on:
         required: true
         default: "gpu-h100"
       smoke_test:
-        description: "Run a short test prediction after pushing"
+        description: "Run a test prediction after pushing"
         type: boolean
         default: true
+      smoke_seconds:
+        description: "Test length in seconds (max_duration; the demo speech is 82 s long)"
+        required: false
+        default: "8"
 
 jobs:
   push:
@@ -157,9 +161,10 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-      - name: Run an 8-second image+speech prediction
+      - name: Run an image+speech test prediction
         env:
           REPLICATE_API_TOKEN: ${{ secrets.REPLICATE_API_TOKEN }}
           VERSION: ${{ needs.push.outputs.version }}
+          SMOKE_SECONDS: ${{ inputs.smoke_seconds }}
           WAIT_MINUTES: "70"
         run: scripts/smoke.sh
