@@ -14,7 +14,7 @@ on:
       model_name:
         description: 'Replicate model: "name" (owner = the account of the token) or "owner/name"'
         required: true
-        default: "longcat-video-avatar-1.6"
+        default: "synthesys-ai/longcat-video-avatar-1.6"
       hardware:
         description: "GPU for the model (only used when the model is first created)"
         required: true
@@ -53,7 +53,7 @@ jobs:
           if [ -z "${REPLICATE_API_TOKEN}" ]; then echo "Missing repository secret REPLICATE_API_TOKEN"; exit 1; fi
           case "$MODEL" in
             */*) full="$MODEL" ;;
-            *) owner=$(curl -sf -H "Authorization: Bearer ${REPLICATE_API_TOKEN}" https://api.replicate.com/v1/account | jq -r .username)
+            *) owner=$(curl --retry 5 --retry-all-errors --retry-delay 5 -sf -H "Authorization: Bearer ${REPLICATE_API_TOKEN}" https://api.replicate.com/v1/account | jq -r .username)
                full="${owner}/${MODEL}" ;;
           esac
           echo "full=$full" >> "$GITHUB_OUTPUT"
@@ -68,7 +68,7 @@ jobs:
           set -euo pipefail
           owner="${MODEL%%/*}"; name="${MODEL##*/}"
           auth="Authorization: Bearer ${REPLICATE_API_TOKEN}"
-          code=$(curl -s -o model.json -w '%{http_code}' -H "$auth" "https://api.replicate.com/v1/models/${owner}/${name}")
+          code=$(curl --retry 5 --retry-all-errors --retry-delay 5 -s -o model.json -w '%{http_code}' -H "$auth" "https://api.replicate.com/v1/models/${owner}/${name}")
           if [ "$code" = "200" ]; then
             echo "Model already exists:"; jq '{url, visibility}' model.json; exit 0
           fi
@@ -79,12 +79,12 @@ jobs:
             paper_url: "https://github.com/meituan-longcat/LongCat-Video/blob/main/assets/LongCat-Video-Avatar-1.6-Tech-Report.pdf",
             license_url: "https://huggingface.co/meituan-longcat/LongCat-Video-Avatar-1.6"
           }')
-          code=$(curl -s -o created.json -w '%{http_code}' -X POST -H "$auth" -H "Content-Type: application/json" \
+          code=$(curl --retry 5 --retry-all-errors --retry-delay 5 -s -o created.json -w '%{http_code}' -X POST -H "$auth" -H "Content-Type: application/json" \
             -d "$body" https://api.replicate.com/v1/models)
           if [ "$code" != "201" ] && [ "$code" != "200" ]; then
             echo "Creating the model failed (HTTP $code):"; cat created.json; echo
             echo "Hardware SKUs this account can use:"
-            curl -s -H "$auth" https://api.replicate.com/v1/hardware | jq -r '.[] | "\(.sku)\t\(.name)"'
+            curl --retry 5 --retry-all-errors --retry-delay 5 -s -H "$auth" https://api.replicate.com/v1/hardware | jq -r '.[] | "\(.sku)\t\(.name)"'
             exit 1
           fi
           echo "Created:"; jq '{url, visibility}' created.json
@@ -112,7 +112,7 @@ jobs:
 
           login_with() {
             local token="$1" code user
-            code=$(curl -s -o verify.json -w '%{http_code}' -X POST --data-urlencode "token=${token}" https://r8.im/cog/v1/verify-token)
+            code=$(curl --retry 5 --retry-all-errors --retry-delay 5 -s -o verify.json -w '%{http_code}' -X POST --data-urlencode "token=${token}" https://r8.im/cog/v1/verify-token)
             if [ "$code" != "200" ]; then echo "  r8.im verify-token: HTTP $code"; return 1; fi
             user=$(jq -r .username verify.json); rm -f verify.json
             printf '%s' "$token" | docker login r8.im --username "$user" --password-stdin >/dev/null
@@ -135,7 +135,7 @@ jobs:
           REPLICATE_API_TOKEN: ${{ secrets.REPLICATE_API_TOKEN }}
         run: |
           set -euo pipefail
-          v=$(curl -sf -H "Authorization: Bearer ${REPLICATE_API_TOKEN}" \
+          v=$(curl --retry 5 --retry-all-errors --retry-delay 5 -sf -H "Authorization: Bearer ${REPLICATE_API_TOKEN}" \
             "https://api.replicate.com/v1/models/${{ steps.model.outputs.full }}" | jq -r '.latest_version.id')
           echo "version=$v" >> "$GITHUB_OUTPUT"
           echo "Pushed version $v"

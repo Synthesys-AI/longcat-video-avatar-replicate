@@ -13,7 +13,7 @@ on:
       model_name:
         description: 'Replicate model: "name" (owner = the account of the token) or "owner/name"'
         required: true
-        default: "longcat-video-avatar-1.6"
+        default: "synthesys-ai/longcat-video-avatar-1.6"
 
 jobs:
   smoke:
@@ -33,7 +33,7 @@ jobs:
           set -euo pipefail
           case "$NAME" in
             */*) MODEL="$NAME" ;;
-            *) MODEL="$(curl -sf -H "Authorization: Bearer ${REPLICATE_API_TOKEN}" https://api.replicate.com/v1/account | jq -r .username)/$NAME" ;;
+            *) MODEL="$(curl --retry 5 --retry-all-errors --retry-delay 5 -sf -H "Authorization: Bearer ${REPLICATE_API_TOKEN}" https://api.replicate.com/v1/account | jq -r .username)/$NAME" ;;
           esac
           export MODEL
           scripts/smoke.sh "$PREDICTION_ID"

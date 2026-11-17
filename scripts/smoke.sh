@@ -11,7 +11,7 @@ id="${1:-}"
 
 if [ -z "$id" ]; then
   version="${VERSION:-}"
-  [ -n "$version" ] || version=$(curl -s -H "$auth" "$api/models/${MODEL}" | jq -r '.latest_version.id // empty')
+  [ -n "$version" ] || version=$(curl --retry 5 --retry-all-errors --retry-delay 5 -s -H "$auth" "$api/models/${MODEL}" | jq -r '.latest_version.id // empty')
   [ -n "$version" ] || { echo "No version found for ${MODEL}"; exit 1; }
   assets="https://raw.githubusercontent.com/meituan-longcat/LongCat-Video/58eb336edc5c8c63389838727e40b8c18434e54e/assets/avatar/single"
   body=$(jq -n --arg v "$version" --arg a "$assets" '{
@@ -24,7 +24,7 @@ if [ -z "$id" ]; then
       seed: 42
     }
   }')
-  id=$(curl -s -X POST -H "$auth" -H "Content-Type: application/json" -d "$body" "$api/predictions" | jq -r '.id // empty')
+  id=$(curl --retry 5 --retry-all-errors --retry-delay 5 -s -X POST -H "$auth" -H "Content-Type: application/json" -d "$body" "$api/predictions" | jq -r '.id // empty')
   [ -n "$id" ] || { echo "Could not start a prediction"; exit 1; }
 fi
 echo "Prediction $id: https://replicate.com/p/$id"
@@ -33,7 +33,7 @@ deadline=$((SECONDS + ${WAIT_MINUTES:-70} * 60))
 status=unknown
 last=""
 while [ "$SECONDS" -lt "$deadline" ]; do
-  code=$(curl -s -o p.json -w '%{http_code}' -H "$auth" "$api/predictions/$id")
+  code=$(curl --retry 5 --retry-all-errors --retry-delay 5 -s -o p.json -w '%{http_code}' -H "$auth" "$api/predictions/$id")
   if [ "$code" = "200" ]; then
     status=$(jq -r .status p.json)
     [ "$status" != "$last" ] && echo "$(date -u +%H:%M:%S) $status"
