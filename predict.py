@@ -90,8 +90,7 @@ GUIDANCE = 1.0
 REF_IMG_INDEX = 10
 MASK_FRAME_RANGE = 0
 
-FIRST_SEGMENT_SECONDS = NUM_FRAMES / FPS  # 3.72 s
-NEXT_SEGMENT_SECONDS = (NUM_FRAMES - NUM_COND_FRAMES) / FPS  # 3.2 s
+# A full first segment is 93 frames (3.72 s); each continuation adds 80 new frames (3.2 s).
 
 # Replicate stops a prediction at 30 min. Stop starting new segments in time to
 # finish the one in flight and encode, and return the video made so far.
@@ -380,10 +379,23 @@ class _SparseAttention:
         return f"self-test max err {err:.4f}"
 
 
-def _segments_for(duration: float) -> int:
-    if duration <= FIRST_SEGMENT_SECONDS:
-        return 1
-    return 1 + math.ceil((duration - FIRST_SEGMENT_SECONDS) / NEXT_SEGMENT_SECONDS)
+def _plan_chunks(target_frames: int) -> list:
+    """Frames to generate per segment so the video just covers `target_frames`.
+
+    Every segment but the last is a full NUM_FRAMES (Meituan's length). The last one is cut
+    to what the audio still needs (rounded up to 4k+1 frames, the VAE's step), instead of
+    rendering a full 3.2 s and trimming most of it away. The first segment yields all its
+    frames; each continuation yields its frames minus the NUM_COND_FRAMES carried over.
+    """
+    def frames_for(n: int) -> int:
+        return min(NUM_FRAMES, (max(n, 1) + 2) // 4 * 4 + 1)
+
+    plan = [frames_for(target_frames)]
+    have = plan[0]
+    while have < target_frames:
+        plan.append(frames_for(NUM_COND_FRAMES + target_frames - have))
+        have += plan[-1] - NUM_COND_FRAMES
+    return plan
 
 
 def _download_weights() -> None:
@@ -877,11 +889,14 @@ class Runner(BaseRunner):
             duration = sf.info(str(speech_wav)).duration
             if duration < 0.5:
                 raise ValueError("The audio is shorter than half a second.")
-            num_segments = _segments_for(duration)
-            generate_seconds = FIRST_SEGMENT_SECONDS + (num_segments - 1) * NEXT_SEGMENT_SECONDS
+            target_frames = max(1, round(duration * FPS))
+            plan = _plan_chunks(target_frames)
+            num_segments = len(plan)
+            new_frames_total = plan[0] + sum(n - NUM_COND_FRAMES for n in plan[1:])
+            generate_seconds = new_frames_total / FPS
             print(
-                f"[predict] audio {duration:.2f}s -> {num_segments} segment(s), "
-                f"{resolution}, {'image' if image else 'text'} mode"
+                f"[predict] audio {duration:.2f}s -> {num_segments} segment(s) of "
+                f"{'/'.join(map(str, plan))} frames, {resolution}, {'image' if image else 'text'} mode"
             )
 
             audio_seconds = generate_seconds + 1.0
@@ -912,9 +927,9 @@ class Runner(BaseRunner):
 
             window = torch.arange(2 * 2 + 1) - 2
 
-            def audio_window(start_idx: int) -> torch.Tensor:
+            def audio_window(start_idx: int, num_frames: int) -> torch.Tensor:
                 centers = torch.arange(
-                    start_idx, start_idx + AUDIO_STRIDE * NUM_FRAMES, AUDIO_STRIDE
+                    start_idx, start_idx + AUDIO_STRIDE * num_frames, AUDIO_STRIDE
                 ).unsqueeze(1) + window.unsqueeze(0)
                 centers = torch.clamp(centers, min=0, max=full_audio_emb.shape[0] - 1)
                 return full_audio_emb[centers][None, ...].to(self.device)
@@ -925,7 +940,6 @@ class Runner(BaseRunner):
             common = dict(
                 prompt=prompt,
                 negative_prompt=NEGATIVE_PROMPT,
-                num_frames=NUM_FRAMES,
                 num_inference_steps=NUM_STEPS,
                 text_guidance_scale=GUIDANCE,
                 audio_guidance_scale=GUIDANCE,
@@ -946,7 +960,8 @@ class Runner(BaseRunner):
                 output, latent = self.pipe.generate_ai2v(
                     image=cond_image,
                     resolution=resolution,
-                    audio_emb=audio_window(audio_start),
+                    num_frames=plan[0],
+                    audio_emb=audio_window(audio_start, plan[0]),
                     **common,
                 )
             else:
@@ -955,18 +970,19 @@ class Runner(BaseRunner):
                 output, latent = self.pipe.generate_at2v(
                     height=height,
                     width=width,
-                    audio_emb=audio_window(audio_start),
+                    num_frames=plan[0],
+                    audio_emb=audio_window(audio_start, plan[0]),
                     **common,
                 )
             video_array = (output[0] * 255).astype(np.uint8)
             del output
             _torch_gc()
             last_segment_seconds = time.time() - t_seg
-            print(f"[predict] segment 1/{num_segments} in {last_segment_seconds:.1f}s "
+            print(f"[predict] segment 1/{num_segments} ({plan[0]} frames) in {last_segment_seconds:.1f}s "
                   f"({self.timer.breakdown(prep, self.timer.snapshot(), last_segment_seconds)})")
 
             frame_h, frame_w = video_array.shape[1:3]
-            total_frames = len(video_array) + (num_segments - 1) * (NUM_FRAMES - NUM_COND_FRAMES)
+            total_frames = len(video_array) + sum(n - NUM_COND_FRAMES for n in plan[1:])
             frames = np.empty((total_frames, frame_h, frame_w, 3), dtype=np.uint8)
             frames[: len(video_array)] = video_array
             n_frames = len(video_array)
@@ -987,7 +1003,8 @@ class Runner(BaseRunner):
                 t_seg = time.time()
                 phases_before = self.timer.snapshot()
                 builds_before = self.kv_cache.builds
-                audio_start += AUDIO_STRIDE * (NUM_FRAMES - NUM_COND_FRAMES)
+                audio_start += AUDIO_STRIDE * (plan[segment_idx - 1] - NUM_COND_FRAMES)
+                chunk_frames = plan[segment_idx]
                 output, latent = self.pipe.generate_avc(
                     video=current_video,
                     video_latent=latent,
@@ -997,7 +1014,8 @@ class Runner(BaseRunner):
                     use_kv_cache=True,  # carried frames computed once per LoRA state
                     offload_kv_cache=False,
                     enhance_hf=False,
-                    audio_emb=audio_window(audio_start),
+                    num_frames=chunk_frames,
+                    audio_emb=audio_window(audio_start, chunk_frames),
                     ref_latent=ref_latent,
                     ref_img_index=REF_IMG_INDEX,
                     mask_frame_range=MASK_FRAME_RANGE,
@@ -1013,7 +1031,8 @@ class Runner(BaseRunner):
                 current_video = [PIL.Image.fromarray(f) for f in new_frames[-NUM_COND_FRAMES:]]
                 last_segment_seconds = time.time() - t_seg
                 print(
-                    f"[predict] segment {segment_idx + 1}/{num_segments} in {last_segment_seconds:.1f}s "
+                    f"[predict] segment {segment_idx + 1}/{num_segments} ({chunk_frames} frames) "
+                    f"in {last_segment_seconds:.1f}s "
                     f"(carried frames computed {cache_builds}x; "
                     f"{self.timer.breakdown(phases_before, self.timer.snapshot(), last_segment_seconds)})"
                 )

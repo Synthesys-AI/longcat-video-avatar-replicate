@@ -36,7 +36,7 @@ machine first boots. That keeps the image small enough to build on a GitHub runn
 On one H100 with FlashAttention 3, 480p takes about 49 s for the first 3.7 s of video and 45 s per 3.2 s after that (50 s before carried-frame reuse, 58.6 s with FlashAttention 2). Almost all of that is the DiT's denoising steps (about 41 s of a 44 s segment); VAE decode is about 2 s. An 8 s clip takes about 2.3 min, even on a freshly booted machine, because setup warms up the audio prep. 82 s should take about 19 min. A cold start adds about 4 min while the weights download. Replicate stops any prediction after 30 minutes. The predictor stops starting new segments
 before it hits that limit and returns the video made so far, and the logs say so.
 
-The logs time each phase: audio prep, then per segment the DiT steps, VAE encode/decode, text encoding and everything else.
+The last segment only generates the frames the audio still needs (rounded up to 4k+1), rather than a full 3.2 s that would mostly be trimmed; a clip under 3.7 s is a single short segment. The logs time each phase: audio prep, then per segment the DiT steps, VAE encode/decode, text encoding and everything else.
 
 ## Publishing
 
