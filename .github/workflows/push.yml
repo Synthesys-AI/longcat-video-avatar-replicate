@@ -145,37 +145,13 @@ jobs:
     needs: push
     if: ${{ inputs.smoke_test }}
     runs-on: ubuntu-latest
-    timeout-minutes: 75
+    timeout-minutes: 80
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
       - name: Run an 8-second image+speech prediction
         env:
           REPLICATE_API_TOKEN: ${{ secrets.REPLICATE_API_TOKEN }}
           VERSION: ${{ needs.push.outputs.version }}
-        run: |
-          set -euo pipefail
-          auth="Authorization: Bearer ${REPLICATE_API_TOKEN}"
-          assets="https://raw.githubusercontent.com/meituan-longcat/LongCat-Video/58eb336edc5c8c63389838727e40b8c18434e54e/assets/avatar/single"
-          body=$(jq -n --arg v "$VERSION" --arg a "$assets" '{
-            version: $v,
-            input: {
-              audio: ($a + "/man.mp3"),
-              image: ($a + "/man.png"),
-              prompt: "A man stands on stage under dramatic lighting, holding a microphone close to his mouth, speaking while smoke swirls around him.",
-              max_duration: 8,
-              seed: 42
-            }
-          }')
-          id=$(curl -sf -X POST -H "$auth" -H "Content-Type: application/json" -d "$body" \
-            https://api.replicate.com/v1/predictions | jq -r .id)
-          echo "Prediction $id: https://replicate.com/p/$id"
-          # A cold boot downloads ~63 GB of weights first, so allow up to an hour.
-          for i in $(seq 1 180); do
-            sleep 20
-            curl -sf -H "$auth" "https://api.replicate.com/v1/predictions/$id" > p.json
-            status=$(jq -r .status p.json)
-            echo "$(date -u +%H:%M:%S) $status"
-            case "$status" in succeeded|failed|canceled) break ;; esac
-          done
-          echo "----- logs -----"; jq -r '.logs // ""' p.json | tail -60
-          jq '{status, output, error, metrics}' p.json
-          [ "$(jq -r .status p.json)" = "succeeded" ]
+          WAIT_MINUTES: "70"
+        run: scripts/smoke.sh

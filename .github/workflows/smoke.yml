@@ -1,0 +1,39 @@
+name: Test prediction
+
+# Start a short test prediction on the latest version, or follow one that's already
+# running (pass its id) without starting a new paid run.
+
+on:
+  workflow_dispatch:
+    inputs:
+      prediction_id:
+        description: "Follow this existing prediction instead of starting one (optional)"
+        required: false
+        default: ""
+      model_name:
+        description: 'Replicate model: "name" (owner = the account of the token) or "owner/name"'
+        required: true
+        default: "longcat-video-avatar-1.6"
+
+jobs:
+  smoke:
+    name: Test prediction
+    runs-on: ubuntu-latest
+    timeout-minutes: 80
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Run or follow the prediction
+        env:
+          REPLICATE_API_TOKEN: ${{ secrets.REPLICATE_API_TOKEN }}
+          NAME: ${{ inputs.model_name }}
+          PREDICTION_ID: ${{ inputs.prediction_id }}
+          WAIT_MINUTES: "70"
+        run: |
+          set -euo pipefail
+          case "$NAME" in
+            */*) MODEL="$NAME" ;;
+            *) MODEL="$(curl -sf -H "Authorization: Bearer ${REPLICATE_API_TOKEN}" https://api.replicate.com/v1/account | jq -r .username)/$NAME" ;;
+          esac
+          export MODEL
+          scripts/smoke.sh "$PREDICTION_ID"
