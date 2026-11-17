@@ -26,6 +26,10 @@ on:
         description: "Run this exact version id (empty = the model's latest)"
         required: false
         default: ""
+      extra_input:
+        description: 'Extra inputs as JSON, e.g. {"sage_attention": true}'
+        required: false
+        default: "{}"
 
 jobs:
   smoke:
@@ -43,6 +47,7 @@ jobs:
           SMOKE_SECONDS: ${{ inputs.seconds }}
           SMOKE_SPARSITY: ${{ inputs.sparse_attention }}
           VERSION: ${{ inputs.version }}
+          SMOKE_INPUT: ${{ inputs.extra_input }}
           WAIT_MINUTES: "70"
         run: |
           set -euo pipefail

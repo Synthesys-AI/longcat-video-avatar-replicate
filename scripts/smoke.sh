@@ -4,7 +4,8 @@
 #   env:   REPLICATE_API_TOKEN (required), MODEL ("owner/name", needed to start one),
 #          VERSION (optional, defaults to the model's latest), WAIT_MINUTES (default 70),
 #          SMOKE_SECONDS (max_duration, default 8; the demo speech is 82 s long),
-#          SMOKE_SPARSITY (sparse_attention, default unset = the model's default)
+#          SMOKE_SPARSITY (sparse_attention, default unset = the model's default),
+#          SMOKE_INPUT (a JSON object merged into the input, e.g. '{"sage_attention": true}')
 # Polling tolerates transient HTTP errors; a cold boot downloads ~63 GB of weights first.
 set -uo pipefail
 api=https://api.replicate.com/v1
@@ -16,7 +17,9 @@ if [ -z "$id" ]; then
   [ -n "$version" ] || version=$(curl --retry 5 --retry-all-errors --retry-delay 5 -s -H "$auth" "$api/models/${MODEL}" | jq -r '.latest_version.id // empty')
   [ -n "$version" ] || { echo "No version found for ${MODEL}"; exit 1; }
   assets="https://raw.githubusercontent.com/meituan-longcat/LongCat-Video/58eb336edc5c8c63389838727e40b8c18434e54e/assets/avatar/single"
-  body=$(jq -n --arg v "$version" --arg a "$assets" --arg d "${SMOKE_SECONDS:-8}" --arg s "${SMOKE_SPARSITY:-}" '{
+  extra="${SMOKE_INPUT:-}"
+  [ -n "$extra" ] || extra='{}'
+  body=$(jq -n --arg v "$version" --arg a "$assets" --arg d "${SMOKE_SECONDS:-8}" --arg s "${SMOKE_SPARSITY:-}" --argjson x "$extra" '{
     version: $v,
     input: {
       audio: ($a + "/man.mp3"),
@@ -25,7 +28,7 @@ if [ -z "$id" ]; then
       max_duration: ($d | tonumber),
       seed: 42
     }
-  } | if $s != "" then .input.sparse_attention = ($s | tonumber) else . end')
+  } | if $s != "" then .input.sparse_attention = ($s | tonumber) else . end | .input += $x')
   id=$(curl --retry 5 --retry-all-errors --retry-delay 5 -s -X POST -H "$auth" -H "Content-Type: application/json" -d "$body" "$api/predictions" | jq -r '.id // empty')
   [ -n "$id" ] || { echo "Could not start a prediction"; exit 1; }
 fi

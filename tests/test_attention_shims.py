@@ -6,16 +6,19 @@ predict.py by AST so the module's cog/CUDA imports are never executed.
 """
 import ast
 import pathlib
+import types
 
 import torch
 
 SRC = pathlib.Path(__file__).resolve().parents[1] / "predict.py"
 _tree = ast.parse(SRC.read_text())
-_ns = {"torch": torch}
+# `_DENSE_OVERRIDE` is the module-level switch `_make_fa_shim` reads at call time.
+_ns = {"torch": torch, "types": types, "_DENSE_OVERRIDE": [None]}
 for node in _tree.body:
-    if isinstance(node, ast.FunctionDef) and node.name in {"_sdpa", "_sdpa_varlen", "_fa3_variant"}:
+    if isinstance(node, ast.FunctionDef) and node.name in {"_sdpa", "_sdpa_varlen", "_fa3_variant", "_make_fa_shim"}:
         exec(compile(ast.Module([node], []), str(SRC), "exec"), _ns)
 _sdpa, _sdpa_varlen, _fa3_variant = _ns["_sdpa"], _ns["_sdpa_varlen"], _ns["_fa3_variant"]
+_make_fa_shim, _DENSE_OVERRIDE = _ns["_make_fa_shim"], _ns["_DENSE_OVERRIDE"]
 
 
 def naive(q, k, v, scale):  # q: [S, H, D], k/v: [T, H, D]
@@ -59,6 +62,42 @@ def test_fa3_variant_names_match_kernel_hub_folders():
     assert _fa3_variant("2.6.0+cu124", False, "12.4") == "torch26-cxx98-cu124-x86_64-linux"
     assert _fa3_variant("2.8.0", True, "12.8") == "torch28-cxx11-cu128-x86_64-linux"
     assert _fa3_variant("2.10.1+cu130", True, "13.0") == "torch210-cxx11-cu130-x86_64-linux"
+
+
+
+def test_shim_returns_tuples_and_routes_dense_calls_to_the_override():
+    calls = []
+
+    def raw(q, k, v, softmax_scale=None, causal=False, **kw):
+        calls.append(("raw", softmax_scale, causal, kw))
+        return "fa3-out"
+
+    def raw_varlen(*a, **kw):
+        calls.append(("varlen",))
+        return "varlen-out"
+
+    shim = _make_fa_shim(raw, raw_varlen)
+    # No override: FA3, wrapped as a tuple the way LongCat unpacks it.
+    x, *_ = shim.flash_attn_func("q", "k", "v", softmax_scale=0.5)
+    assert x == "fa3-out" and calls[-1] == ("raw", 0.5, False, {})
+    assert shim.flash_attn_varlen_func("q", "k", "v", cu_seqlens_q=None)[0] == "varlen-out"
+
+    # A request turns SageAttention on: dense calls go there, varlen stays on FA3.
+    def sage(q, k, v, scale):
+        calls.append(("sage", scale))
+        return "sage-out"
+
+    _DENSE_OVERRIDE[0] = sage
+    try:
+        x, *_ = shim.flash_attn_func("q", "k", "v", softmax_scale=0.25)
+        assert x == "sage-out" and calls[-1] == ("sage", 0.25)
+        assert shim.flash_attn_varlen_func("q", "k", "v")[0] == "varlen-out"
+        # Anything unusual (causal, extra options) still goes to FA3.
+        assert shim.flash_attn_func("q", "k", "v", causal=True)[0] == "fa3-out"
+        assert shim.flash_attn_func("q", "k", "v", window_size=(1, 1))[0] == "fa3-out"
+    finally:
+        _DENSE_OVERRIDE[0] = None
+    assert shim.flash_attn_func("q", "k", "v")[0] == "fa3-out"
 
 
 if __name__ == "__main__":

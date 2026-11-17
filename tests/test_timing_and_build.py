@@ -68,6 +68,9 @@ def test_image_fa3_copy_uses_the_same_revision_as_predict():
     assert f"revision='{rev}'" in cog
     assert "local_dir='/opt/flash-attn3'" in cog
     assert 'FA3_BAKED_DIR = FsPath("/opt/flash-attn3")' in SRC.read_text()
+    sage_rev = re.search(r'SAGE_KERNEL_REVISION = "([0-9a-f]{40})"', SRC.read_text()).group(1)
+    assert f"revision='{sage_rev}'" in cog and "local_dir='/opt/sage-attention'" in cog
+    assert 'SAGE_BAKED_DIR = FsPath("/opt/sage-attention")' in SRC.read_text()
 
 
 if __name__ == "__main__":

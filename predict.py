@@ -25,6 +25,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import types
 from contextlib import contextmanager
 from pathlib import Path as FsPath
 from typing import Optional
@@ -139,6 +140,81 @@ def _free_port() -> int:
 def _torch_gc() -> None:
     torch.cuda.empty_cache()
     torch.cuda.ipc_collect()
+
+
+# SageAttention2 (8-bit attention: INT8 QK, FP8 PV) from Hugging Face's kernel hub, which
+# only has builds for torch 2.8+. Copied into the image by cog.yaml (keep in sync).
+SAGE_KERNEL_REPO = "kernels-community/sage-attention"
+SAGE_KERNEL_REVISION = "f81ef5e170c530160930bbb3394df612800e98e7"
+SAGE_BAKED_DIR = FsPath("/opt/sage-attention")
+
+
+def _load_sage():
+    """Import the hub SageAttention package and return its H100 kernel function. (The
+    package's own `sageattn()` prints a debug line on every call, so it is bypassed.)"""
+    import importlib.util
+
+    variant = _fa3_variant(torch.__version__, torch._C._GLIBCXX_USE_CXX11_ABI, torch.version.cuda or "")
+    rel = f"build/{variant}"
+
+    def complete(root: FsPath) -> bool:
+        return (root / rel / "__init__.py").exists() and any((root / rel).glob("_sage_attention_*.so"))
+
+    if complete(SAGE_BAKED_DIR):
+        root, where = SAGE_BAKED_DIR, "image"
+    else:
+        from huggingface_hub import snapshot_download
+
+        root, where = WEIGHTS_ROOT / "sage-attention", "downloaded"
+        snapshot_download(repo_id=SAGE_KERNEL_REPO, revision=SAGE_KERNEL_REVISION, local_dir=str(root),
+                          allow_patterns=[f"{rel}/*"])
+        if not complete(root):
+            raise RuntimeError(f"no SageAttention kernel build for {variant}")
+    pkg = root / rel
+    spec = importlib.util.spec_from_file_location(
+        "sage_attention_hub", pkg / "__init__.py", submodule_search_locations=[str(pkg)]
+    )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["sage_attention_hub"] = module
+    spec.loader.exec_module(module)
+    core = sys.modules["sage_attention_hub.core"]
+    return core.sageattn_qk_int8_pv_fp8_cuda_sm90, f"{SAGE_KERNEL_REPO}@{SAGE_KERNEL_REVISION[:7]} {variant} ({where})"
+
+
+class _SageAttention:
+    """Dense attention through SageAttention2's H100 kernel, on LongCat's [B, S, H, D]
+    tensors. Used for a request only when it sets `sage_attention`."""
+
+    def __init__(self, kernel=None):
+        self.kernel = kernel
+        self.available = False
+        self.calls = 0
+
+    def attend(self, q, k, v, softmax_scale=None):
+        self.calls += 1
+        return self.kernel(q, k, v, tensor_layout="NHD", is_causal=False, sm_scale=softmax_scale,
+                           pv_accum_dtype="fp32+fp32")
+
+    def self_test(self) -> str:
+        """Against PyTorch SDPA, with more keys than queries (a continuation chunk) and a
+        key length that is not a multiple of 128 (the kernel pads it)."""
+        if torch.cuda.get_device_capability() != (9, 0):
+            raise RuntimeError(f"needs an H100 (sm90), got sm{''.join(map(str, torch.cuda.get_device_capability()))}")
+        g = torch.Generator(device="cuda").manual_seed(0)
+        q = torch.randn(1, 1024, 8, 128, device="cuda", dtype=torch.bfloat16, generator=g)
+        k = torch.randn(1, 1500, 8, 128, device="cuda", dtype=torch.bfloat16, generator=g)
+        v = torch.randn(1, 1500, 8, 128, device="cuda", dtype=torch.bfloat16, generator=g)
+        q[:, :, :, :16] *= 4  # peakier attention than plain noise
+        scale = 128 ** -0.5
+        out = self.attend(q, k, v, scale).float()
+        ref = _sdpa(q, k, v, softmax_scale=scale).float()
+        rel = ((out - ref).norm() / ref.norm()).item()
+        cos = torch.nn.functional.cosine_similarity(out.flatten(), ref.flatten(), dim=0).item()
+        if out.shape != q.shape or not (rel < 0.08 and cos > 0.995):
+            raise RuntimeError(f"self-test mismatch: rel err {rel:.4f}, cosine {cos:.5f}")
+        self.calls = 0
+        self.available = True
+        return f"self-test rel err {rel:.4f}, cosine {cos:.5f}"
 
 
 class _PhaseTimer:
@@ -414,6 +490,33 @@ def _load_fa3():
     return importlib.import_module("flash_attn3"), f"{FA3_KERNEL_REPO}@{FA3_KERNEL_REVISION[:7]} {variant} ({where})"
 
 
+# Per-request replacement for LongCat's dense attention calls (SageAttention), or None.
+_DENSE_OVERRIDE = [None]
+
+
+def _make_fa_shim(raw_func, raw_varlen) -> types.ModuleType:
+    """A `flash_attn_interface` module for LongCat's FA3 code path. It always returns
+    (out, lse) tuples, which LongCat unpacks, and lets a request route the dense
+    (non-causal, no extra options) calls to `_DENSE_OVERRIDE[0]`. Varlen calls (the short
+    text cross-attention) always use the raw backend."""
+    shim = types.ModuleType("flash_attn_interface")
+
+    def flash_attn_func(q, k, v, softmax_scale=None, causal=False, **kwargs):
+        alt = _DENSE_OVERRIDE[0]
+        if alt is not None and not causal and not kwargs:
+            return alt(q, k, v, softmax_scale), None
+        res = raw_func(q, k, v, softmax_scale=softmax_scale, causal=causal, **kwargs)
+        return tuple(res) if isinstance(res, (tuple, list)) else (res, None)
+
+    def flash_attn_varlen_func(*args, **kwargs):
+        res = raw_varlen(*args, **kwargs)
+        return tuple(res) if isinstance(res, (tuple, list)) else (res, None)
+
+    shim.flash_attn_func = flash_attn_func
+    shim.flash_attn_varlen_func = flash_attn_varlen_func
+    return shim
+
+
 def _install_attention_backend() -> str:
     """Pick the fastest attention that passes a self-test: "fa3", "fa2" or "sdpa".
 
@@ -424,8 +527,6 @@ def _install_attention_backend() -> str:
     silently take the first row, so both functions are wrapped to always return a tuple.
     FA2 is LongCat's own FA2 path (the dit's default). LONGCAT_ATTENTION=fa3|fa2|sdpa forces one.
     """
-    import types
-
     want = os.environ.get("LONGCAT_ATTENTION", "auto").lower()
     if want in ("auto", "fa3"):
         try:
@@ -460,20 +561,7 @@ def _install_attention_backend() -> str:
                 raise RuntimeError(f"varlen self-test mismatch: shape {tuple(out_v.shape)}, max err {err_v:.4f}")
             err = max(err, err_v)
 
-            raw_func, raw_varlen = fa3.flash_attn_func, fa3.flash_attn_varlen_func
-            shim = types.ModuleType("flash_attn_interface")
-
-            def flash_attn_func(*args, **kwargs):
-                res = raw_func(*args, **kwargs)
-                return tuple(res) if isinstance(res, (tuple, list)) else (res, None)
-
-            def flash_attn_varlen_func(*args, **kwargs):
-                res = raw_varlen(*args, **kwargs)
-                return tuple(res) if isinstance(res, (tuple, list)) else (res, None)
-
-            shim.flash_attn_func = flash_attn_func
-            shim.flash_attn_varlen_func = flash_attn_varlen_func
-            sys.modules["flash_attn_interface"] = shim
+            sys.modules["flash_attn_interface"] = _make_fa_shim(fa3.flash_attn_func, fa3.flash_attn_varlen_func)
             print(f"[setup] attention: FlashAttention 3 from {source} "
                   f"(self-test max err {err:.4f}, {time.time() - t0:.0f}s)")
             return "fa3"
@@ -493,11 +581,10 @@ def _install_attention_backend() -> str:
                 raise
             print(f"[setup] attention: FlashAttention 2 unavailable ({exc!r})")
 
-    shim = types.ModuleType("flash_attn_interface")
-    shim.flash_attn_func = lambda q, k, v, softmax_scale=None, causal=False, **_: (
-        _sdpa(q, k, v, softmax_scale=softmax_scale, causal=causal), None)
-    shim.flash_attn_varlen_func = lambda *a, **kw: (_sdpa_varlen(*a, **kw), None)
-    sys.modules["flash_attn_interface"] = shim
+    sys.modules["flash_attn_interface"] = _make_fa_shim(
+        lambda q, k, v, softmax_scale=None, causal=False, **_: _sdpa(q, k, v, softmax_scale=softmax_scale, causal=causal),
+        _sdpa_varlen,
+    )
     print("[setup] attention: PyTorch SDPA" + (" (forced)" if want == "sdpa" else ""))
     return "sdpa"
 
@@ -620,6 +707,13 @@ class Runner(BaseRunner):
             print(f"[setup] sparse attention available ({self.sparse.self_test()})")
         except Exception as exc:  # noqa: BLE001 - the input then runs dense
             print(f"[setup] sparse attention unavailable ({exc!r}); requests run dense")
+        self.sage = _SageAttention()
+        if self.attention in ("fa3", "sdpa"):  # Sage plugs into LongCat's FA3 code path
+            try:
+                self.sage.kernel, source = _load_sage()
+                print(f"[setup] SageAttention available from {source} ({self.sage.self_test()})")
+            except Exception as exc:  # noqa: BLE001 - the input then runs on FA3
+                print(f"[setup] SageAttention unavailable ({exc!r}); requests use {self.attention}")
         # While sparse attention is on, image mode picks sizes from the 128-px bucket table.
         pipe_get_shape = type(self.pipe).get_condition_shape
 
@@ -735,6 +829,13 @@ class Runner(BaseRunner):
             ge=0.0,
             le=0.9375,
         ),
+        sage_attention: bool = Input(
+            description=(
+                "Experimental speed-up: 8-bit attention (SageAttention2) for the video's attention. "
+                "Same frame sizes; the picture may differ slightly from the default."
+            ),
+            default=False,
+        ),
     ) -> Path:
         from diffusers.utils import load_image
 
@@ -745,8 +846,14 @@ class Runner(BaseRunner):
         if seed is None:
             seed = secrets.randbelow(2**31)
         sparse_on = self.sparse.set(float(sparse_attention))
+        sage_on = bool(sage_attention) and self.sage.available
+        _DENSE_OVERRIDE[0] = self.sage.attend if sage_on else None
+        self.sage.calls = 0
         print(f"[predict] seed={seed} attention={self.attention}"
-              + (f" sparse={sparse_attention}" if sparse_on else ""))
+              + (f" sparse={sparse_attention}" if sparse_on else "")
+              + (" sage=on" if sage_on else ""))
+        if sage_attention and not sage_on:
+            print("[predict] SageAttention is unavailable on this machine; running without it")
         if sparse_attention > 0 and not sparse_on:
             print("[predict] sparse attention is unavailable on this machine; running dense")
 
@@ -923,12 +1030,15 @@ class Runner(BaseRunner):
                     torch.from_numpy(frames[:n_out]), str(out_base), str(speech_wav), fps=FPS, quality=10
                 )
             print(f"[predict] write video {self.timer.totals['write video']:.1f}s")
+            if sage_on:
+                print(f"[predict] SageAttention: {self.sage.calls} attention calls")
             if sparse_on:
                 print(f"[predict] sparse attention: {self.sparse.calls['sparse']} sparse / "
                       f"{self.sparse.calls['dense']} dense calls, {frame_w}x{frame_h}")
             print(f"[predict] done in {time.time() - t_start:.0f}s")
             return Path(f"{out_base}.mp4")
         finally:
+            _DENSE_OVERRIDE[0] = None
             self.sparse.set(0.0)
             self.kv_cache.release()
             if hasattr(self.pipe, "_clear_cache"):

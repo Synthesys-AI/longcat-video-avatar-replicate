@@ -4,7 +4,7 @@
 # Written for Cog v0.23 (BaseRunner / run()).
 build:
   gpu: true
-  cuda: "12.4"
+  cuda: "12.8"
   python_version: "3.10"
   system_packages:
     - ffmpeg
@@ -30,9 +30,21 @@ build:
       hub.snapshot_download(allow_patterns=[pkg + '/' + lib + '*.so'], **kw);
       print('FA3 kernel copied into the image:', pkg, lib)"
       || echo "FA3 kernel NOT copied into the image; predict.py will download it at startup"
+    # SageAttention (8-bit attention, `sage_attention` input): the prebuilt build for this torch
+    # from the same hub, copied in the same way. Keep the revision in sync with
+    # SAGE_KERNEL_REVISION in predict.py.
+    - >-
+      python -c "import torch, huggingface_hub as hub;
+      major, minor = torch.__version__.split('+')[0].split('.')[:2];
+      abi = 'cxx11' if torch._C._GLIBCXX_USE_CXX11_ABI else 'cxx98';
+      cu = torch.version.cuda.replace('.', '');
+      variant = f'torch{major}{minor}-{abi}-cu{cu}-x86_64-linux';
+      hub.snapshot_download(repo_id='kernels-community/sage-attention', revision='f81ef5e170c530160930bbb3394df612800e98e7', local_dir='/opt/sage-attention', allow_patterns=[f'build/{variant}/*']);
+      print('SageAttention kernel copied into the image:', variant)"
+      || echo "SageAttention kernel NOT copied into the image; predict.py will download it at startup"
     # FA2 below is the fallback if FA3 fails its self-test.
-    # Prebuilt FlashAttention-2 for torch 2.6 / CUDA 12 / py3.10 (PyPI torch 2.6 uses the old C++ ABI).
-    - pip install --no-deps "https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.4.post1/flash_attn-2.7.4.post1+cu12torch2.6cxx11abiFALSE-cp310-cp310-linux_x86_64.whl"
+    # Prebuilt FlashAttention-2 for torch 2.8 / CUDA 12 / py3.10 (PyPI torch 2.8 uses the new C++ ABI).
+    - pip install --no-deps "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.8cxx11abiTRUE-cp310-cp310-linux_x86_64.whl"
     # Meituan's inference code, pinned to the commit this predictor was written against.
     - git clone https://github.com/meituan-longcat/LongCat-Video /opt/LongCat-Video && cd /opt/LongCat-Video && git checkout 58eb336edc5c8c63389838727e40b8c18434e54e && rm -rf .git
 run: "predict.py:Runner"

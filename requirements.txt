@@ -1,9 +1,12 @@
 # Mirrors LongCat-Video's requirements.txt + requirements_avatar.txt at commit 58eb336,
 # minus what the avatar path never imports (streamlit, openai, tritonserverclient, the
 # bogus `libsndfile1` pip package — the real lib is an apt package in cog.yaml).
-torch==2.6.0
-torchvision==0.21.0
-torchaudio==2.6.0
+# torch is 2.8 (Meituan pins 2.6) because the prebuilt SageAttention kernels on Hugging Face's
+# kernel hub start at torch 2.8, and Replicate has a prebuilt Cog base image for
+# CUDA 12.8 / Python 3.10 / torch 2.8.0 (no base image means a much bigger, slower upload).
+torch==2.8.0
+torchvision==0.23.0
+torchaudio==2.8.0
 numpy==1.26.4
 transformers==4.41.0
 diffusers==0.35.1
@@ -26,7 +29,7 @@ scipy==1.15.3
 soundfile==0.13.1
 soxr==0.5.0.post1
 librosa==0.11.0
-sympy==1.13.1
+sympy==1.14.0
 audio-separator==0.30.2
 pyloudnorm==0.1.1
 nvidia-ml-py==13.580.65
