@@ -14,6 +14,7 @@ This follows the model card's 1.6 recipe on one GPU:
 - DMD/OPSD LoRA mix, `mix_steps=4` and `mix_alpha=1.0` by default.
 - Whisper-large-v3 audio features and Kim_Vocal_2 voice isolation.
 - 25 fps output, muxed with your original audio.
+- The 13 frames each segment carries over are computed once per LoRA setting (twice per segment), not on every step. That is LongCat's own KV cache, which Meituan's demo only uses with the LoRA mix off, because the mix changes the LoRA weights partway through. Here the cache is rebuilt when they change. Those frames never see the new frames, so the video is the same.
 - FlashAttention 3 on the H100, from a pinned prebuilt torch 2.6 build on Hugging Face's kernel hub (`kernels-community/flash-attn3`), fetched at startup. PyTorch's own FA3 wheel needs torch 2.9, and Replicate has no prebuilt base image for that, so the image would carry all of torch and take hours to upload. FA3 is self-tested against PyTorch SDPA at startup. If it fails, FlashAttention 2 takes over, then SDPA. Set `LONGCAT_ATTENTION=fa3|fa2|sdpa` to force one.
 
 Meituan's inference code is cloned at a pinned commit, `58eb336`, when the image is built.

@@ -124,6 +124,61 @@ def _torch_gc() -> None:
     torch.cuda.ipc_collect()
 
 
+class _MixAwareKVCache:
+    """Reuse the carried-over frames' keys/values while the DMD/OPSD LoRA mix is on.
+
+    In a continuation segment the carried-over frames (and the reference frame) only attend
+    to each other, get no text or audio cross-attention and sit at timestep 0, so their
+    attention keys/values are the same at every denoising step, as long as the LoRA weights
+    are. LongCat can compute them once per segment (`_cache_clean_latents`, its KV cache),
+    but the mix swaps LoRA weights at step `mix_steps`, so Meituan's demo turns the cache
+    off whenever the mix is on and recomputes those frames on every step. Here the cache is
+    rebuilt when the LoRA state changes instead: twice per segment with the default mix.
+    """
+
+    def __init__(self, pipe):
+        self.pipe, self.dit = pipe, pipe.dit
+        self._orig_cache = pipe._cache_clean_latents
+        self._orig_set_step = pipe.dit.set_lora_mix_step
+        self._args = None
+        self._built_for = None
+        self.live = {}  # the dict object the denoising loop holds; refilled in place
+        self.builds = 0
+        pipe._cache_clean_latents = self._cache_clean_latents
+        pipe.dit.set_lora_mix_step = self._set_lora_mix_step
+
+    def _state(self):
+        return getattr(self.dit, "_lora_mix_active", None)
+
+    def _build(self) -> None:
+        self.live.clear()  # drop the old keys/values (~6 GB at 480p) before computing new ones
+        args, kwargs = self._args
+        self._orig_cache(*args, **kwargs)  # one DiT pass over the carried frames, current LoRAs
+        self.live.update(self.pipe.kv_cache_dict)
+        self.pipe.kv_cache_dict = self.live
+        self._built_for = self._state()
+        self.builds += 1
+
+    def _cache_clean_latents(self, *args, **kwargs) -> None:
+        # Called once per segment before the loop: build for the LoRA state step 0 uses.
+        if getattr(self.dit, "lora_mix_config", None) is not None:
+            self._orig_set_step(0)
+        self._args = (args, kwargs)
+        self._build()
+
+    def _set_lora_mix_step(self, step_index) -> None:
+        self._orig_set_step(step_index)
+        if self._args is not None and self._state() != self._built_for:
+            self._build()
+
+    def release(self) -> None:
+        self.live.clear()
+        self._args = None
+        self._built_for = None
+        if getattr(self.pipe, "kv_cache_dict", None) is self.live:
+            self.pipe.kv_cache_dict = None
+
+
 def _segments_for(duration: float) -> int:
     if duration <= FIRST_SEGMENT_SECONDS:
         return 1
@@ -412,6 +467,7 @@ class Runner(BaseRunner):
             model_type=MODEL_TYPE,
         )
         self.pipe.to(self.device)
+        self.kv_cache = _MixAwareKVCache(self.pipe)
         print(
             f"[setup] ready in {time.time() - t_setup:.0f}s, "
             f"{torch.cuda.memory_allocated() / 1e9:.1f} GB on GPU"
@@ -590,6 +646,7 @@ class Runner(BaseRunner):
                     )
                     break
                 t_seg = time.time()
+                builds_before = self.kv_cache.builds
                 audio_start += AUDIO_STRIDE * (NUM_FRAMES - NUM_COND_FRAMES)
                 output, latent = self.pipe.generate_avc(
                     video=current_video,
@@ -597,7 +654,7 @@ class Runner(BaseRunner):
                     height=frame_h,
                     width=frame_w,
                     num_cond_frames=NUM_COND_FRAMES,
-                    use_kv_cache=int(mix_steps) == 0,
+                    use_kv_cache=True,  # carried frames computed once per LoRA state
                     offload_kv_cache=False,
                     enhance_hf=False,
                     audio_emb=audio_window(audio_start),
@@ -606,6 +663,8 @@ class Runner(BaseRunner):
                     mask_frame_range=MASK_FRAME_RANGE,
                     **common,
                 )
+                cache_builds = self.kv_cache.builds - builds_before
+                self.kv_cache.release()
                 new_frames = (output[0] * 255).astype(np.uint8)
                 del output
                 appended = new_frames[NUM_COND_FRAMES:]
@@ -614,7 +673,8 @@ class Runner(BaseRunner):
                 current_video = [PIL.Image.fromarray(f) for f in new_frames]
                 last_segment_seconds = time.time() - t_seg
                 print(
-                    f"[predict] segment {segment_idx + 1}/{num_segments} in {last_segment_seconds:.1f}s"
+                    f"[predict] segment {segment_idx + 1}/{num_segments} in {last_segment_seconds:.1f}s "
+                    f"(carried frames computed {cache_builds}x)"
                 )
 
             # 5. Encode with the (trimmed) original audio. Segments overshoot the speech by up
@@ -630,6 +690,7 @@ class Runner(BaseRunner):
             print(f"[predict] done in {time.time() - t_start:.0f}s")
             return Path(f"{out_base}.mp4")
         finally:
+            self.kv_cache.release()
             if hasattr(self.pipe, "_clear_cache"):
                 self.pipe._clear_cache()
             _torch_gc()
