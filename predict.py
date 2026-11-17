@@ -18,6 +18,7 @@ import collections
 import functools
 import math
 import os
+import re
 import secrets
 import shutil
 import socket
@@ -151,31 +152,19 @@ SAGE_BAKED_DIR = FsPath("/opt/sage-attention")
 def _load_sage():
     """Import the hub SageAttention package and return its H100 kernel function. (The
     package's own `sageattn()` prints a debug line on every call, so it is bypassed.)"""
-    import importlib.util
-
     variant = _fa3_variant(torch.__version__, torch._C._GLIBCXX_USE_CXX11_ABI, torch.version.cuda or "")
     rel = f"build/{variant}"
-
-    def complete(root: FsPath) -> bool:
-        return (root / rel / "__init__.py").exists() and any((root / rel).glob("_sage_attention_*.so"))
-
-    if complete(SAGE_BAKED_DIR):
-        root, where = SAGE_BAKED_DIR, "image"
-    else:
+    pkg, where = _find_hub_package(SAGE_BAKED_DIR, rel, "_sage_attention_"), "image"
+    if pkg is None:
         from huggingface_hub import snapshot_download
 
         root, where = WEIGHTS_ROOT / "sage-attention", "downloaded"
         snapshot_download(repo_id=SAGE_KERNEL_REPO, revision=SAGE_KERNEL_REVISION, local_dir=str(root),
                           allow_patterns=[f"{rel}/*"])
-        if not complete(root):
+        pkg = _find_hub_package(root, rel, "_sage_attention_")
+        if pkg is None:
             raise RuntimeError(f"no SageAttention kernel build for {variant}")
-    pkg = root / rel
-    spec = importlib.util.spec_from_file_location(
-        "sage_attention_hub", pkg / "__init__.py", submodule_search_locations=[str(pkg)]
-    )
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["sage_attention_hub"] = module
-    spec.loader.exec_module(module)
+    _import_hub_package(pkg, "sage_attention_hub")
     core = sys.modules["sage_attention_hub.core"]
     return core.sageattn_qk_int8_pv_fp8_cuda_sm90, f"{SAGE_KERNEL_REPO}@{SAGE_KERNEL_REVISION[:7]} {variant} ({where})"
 
@@ -214,6 +203,109 @@ class _SageAttention:
         self.calls = 0
         self.available = True
         return f"self-test rel err {rel:.4f}, cosine {cos:.5f}"
+
+
+# Experimental FP8 matmuls (`fp8_matmuls` input) for the DiT's big linear layers: each
+# input row and each weight row is scaled into float8 e4m3 on the fly (no stored copy,
+# so no extra GPU memory), multiplied with the H100's FP8 tensor cores via
+# torch._scaled_mm, and accumulated in bf16. LoRA branches and small layers stay bf16.
+_FP8_ON = [False]
+FP8_MIN_ROWS = 256  # smaller matmuls (timestep / text projections) aren't worth it
+
+
+def _fp8_targets(dit) -> list:
+    """The DiT's big linear layers: inside the transformer blocks, not the adaLN
+    modulation (it maps a 512-d timestep embedding), both sides >= 1024 and multiples of
+    16 (FP8 tensor-core shapes)."""
+    out = []
+    for name, m in dit.named_modules():
+        if not isinstance(m, torch.nn.Linear) or not name.startswith("blocks."):
+            continue
+        if "adaLN" in name or "modulation" in name:
+            continue
+        if min(m.in_features, m.out_features) < 1024 or m.in_features % 16 or m.out_features % 16:
+            continue
+        out.append((name, m))
+    return out
+
+
+def _install_fp8(dit, fp8_linear, counter: list) -> int:
+    """Route the target layers through `fp8_linear` while `_FP8_ON[0]` is set.
+
+    LongCat's LoRA wrapper replaces a layer's `forward` and calls `layer.org_forward`
+    at call time (and moves `forward` back to `org_forward` when LoRAs are disabled), so
+    the FP8-capable forward goes into `org_forward` when the layer is wrapped, else into
+    `forward`. Either way it survives every enable/disable cycle, and the LoRA branches
+    keep running in bf16 on top."""
+    targets = _fp8_targets(dit)
+    for _, lin in targets:
+        def forward(x, lin=lin):
+            if _FP8_ON[0] and x.numel() >= FP8_MIN_ROWS * x.shape[-1]:
+                counter[0] += 1
+                return fp8_linear(x, lin.weight, lin.bias)
+            return torch.nn.functional.linear(x, lin.weight, lin.bias)
+
+        if hasattr(lin, "org_forward"):
+            lin.org_forward = forward
+        else:
+            lin.forward = forward
+    return len(targets)
+
+
+def _make_fp8_linear():
+    """Build the FP8 linear: a Triton kernel that quantizes each row in one pass
+    (amax -> scale -> float8 e4m3), then torch._scaled_mm with per-row scales."""
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def _rowwise_fp8(x_ptr, q_ptr, s_ptr, K, stride_x, stride_q, BLOCK: tl.constexpr):
+        row = tl.program_id(0).to(tl.int64)
+        offs = tl.arange(0, BLOCK)
+        mask = offs < K
+        x = tl.load(x_ptr + row * stride_x + offs, mask=mask, other=0.0).to(tl.float32)
+        scale = tl.maximum(tl.max(tl.abs(x), axis=0), 1e-6) / 448.0
+        tl.store(q_ptr + row * stride_q + offs, (x / scale).to(tl.float8e4nv), mask=mask)
+        tl.store(s_ptr + row, scale)
+
+    def quantize_rows(x2d):
+        rows, k = x2d.shape
+        q = torch.empty((rows, k), device=x2d.device, dtype=torch.float8_e4m3fn)
+        scales = torch.empty((rows,), device=x2d.device, dtype=torch.float32)
+        block = triton.next_power_of_2(k)
+        _rowwise_fp8[(rows,)](x2d, q, scales, k, x2d.stride(0), q.stride(0), BLOCK=block,
+                              num_warps=16 if block >= 8192 else 8)
+        return q, scales
+
+    def fp8_linear(x, weight, bias):
+        shape = x.shape
+        x2 = x.reshape(-1, shape[-1]).contiguous()
+        xq, xs = quantize_rows(x2)
+        wq, ws = quantize_rows(weight.contiguous())
+        out = torch._scaled_mm(xq, wq.t(), scale_a=xs.view(-1, 1), scale_b=ws.view(1, -1),
+                               out_dtype=x.dtype, use_fast_accum=True)
+        if bias is not None:
+            out = out + bias
+        return out.view(*shape[:-1], weight.shape[0])
+
+    return fp8_linear
+
+
+def _fp8_self_test(fp8_linear) -> str:
+    """Against bf16 F.linear on a DiT-sized layer (needs an H100: FP8 rowwise scaling)."""
+    if torch.cuda.get_device_capability() < (9, 0):
+        raise RuntimeError("needs an H100 (sm90) for FP8 matmuls")
+    g = torch.Generator(device="cuda").manual_seed(0)
+    x = torch.randn(2, 512, 4096, device="cuda", dtype=torch.bfloat16, generator=g)
+    w = (torch.randn(12288, 4096, device="cuda", generator=g) * 0.02).to(torch.bfloat16)
+    b = (torch.randn(12288, device="cuda", generator=g) * 0.02).to(torch.bfloat16)
+    ref = torch.nn.functional.linear(x, w, b).float()
+    out = fp8_linear(x, w, b).float()
+    rel = ((out - ref).norm() / ref.norm()).item()
+    cos = torch.nn.functional.cosine_similarity(out.flatten(), ref.flatten(), dim=0).item()
+    if out.shape != ref.shape or not (rel < 0.06 and cos > 0.998):
+        raise RuntimeError(f"self-test mismatch: rel err {rel:.4f}, cosine {cos:.5f}")
+    return f"self-test rel err {rel:.4f}, cosine {cos:.5f}"
 
 
 class _PhaseTimer:
@@ -460,12 +552,37 @@ def _fa3_variant(torch_version: str, cxx11_abi: bool, cuda_version: str) -> str:
     return f"torch{major}{minor}-{'cxx11' if cxx11_abi else 'cxx98'}-cu{cuda_version.replace('.', '')}-x86_64-linux"
 
 
+def _find_hub_package(root: FsPath, rel: str, lib_prefix: str):
+    """The folder with a kernel-hub build's `_ops.py` and the extension it loads, or None.
+
+    Older builds (FA3 for torch 2.6) keep the package in build/<variant>/<name>/; newer
+    ones (torch 2.8: FA3, SageAttention) put it straight in build/<variant>/, with <name>/
+    only a redirect. Both are accepted.
+    """
+    base = root / rel
+    for ops in sorted(base.glob("_ops.py")) + sorted(base.glob("*/_ops.py")):
+        m = re.search(rf"from \. import ({lib_prefix}\w+)", ops.read_text())
+        if m and any(ops.parent.glob(f"{m.group(1)}*.so")):
+            return ops.parent
+    return None
+
+
+def _import_hub_package(pkg_dir: FsPath, name: str):
+    """Import a kernel-hub package folder (its name may contain dashes) as `name`."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        name, pkg_dir / "__init__.py", submodule_search_locations=[str(pkg_dir)]
+    )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 def _load_fa3():
     """Import FA3: an installed `flash_attn_interface` wheel if present, else the pinned
-    kernel-hub build for this torch (downloaded next to the weights, ~0.8 GB)."""
-    import importlib
-    import re
-
+    kernel-hub build for this torch: the copy in the image, or downloaded (~0.8 GB)."""
     try:
         import flash_attn_interface as fa3
 
@@ -473,33 +590,26 @@ def _load_fa3():
     except ImportError:
         pass
 
-    from huggingface_hub import snapshot_download
-
     variant = _fa3_variant(torch.__version__, torch._C._GLIBCXX_USE_CXX11_ABI, torch.version.cuda or "")
-    pkg = f"build/{variant}/flash_attn3"
-    lib_re = r"from \. import (_flash_attn3_\w+)"
+    rel = f"build/{variant}"
+    pkg, where = _find_hub_package(FA3_BAKED_DIR, rel, "_flash_attn3_"), "image"
+    if pkg is None:
+        from huggingface_hub import snapshot_download
 
-    def complete(root: FsPath) -> bool:
-        ops = root / pkg / "_ops.py"
-        if not ops.exists():
-            return False
-        m = re.search(lib_re, ops.read_text())
-        return bool(m) and any((root / pkg).glob(f"{m.group(1)}*.so"))
-
-    if complete(FA3_BAKED_DIR):
-        root, where = FA3_BAKED_DIR, "image"
-    else:
         root, where = WEIGHTS_ROOT / "flash-attn3", "downloaded"
         pull = dict(repo_id=FA3_KERNEL_REPO, revision=FA3_KERNEL_REVISION, local_dir=str(root))
-        snapshot_download(allow_patterns=[f"{pkg}/*.py"], **pull)
-        ops = root / pkg / "_ops.py"
-        if not ops.exists():
+        snapshot_download(allow_patterns=[f"{rel}/*.py", f"{rel}/*.json"], **pull)
+        ops = sorted((root / rel).glob("_ops.py")) + sorted((root / rel).glob("*/_ops.py"))
+        if not ops:
             raise RuntimeError(f"no FA3 kernel build for {variant}")
-        # The folder holds several builds of the extension; fetch only the one _ops.py loads.
-        lib = re.search(lib_re, ops.read_text()).group(1)
-        snapshot_download(allow_patterns=[f"{pkg}/{lib}*.so"], **pull)
-    sys.path.insert(0, str(root / "build" / variant))
-    return importlib.import_module("flash_attn3"), f"{FA3_KERNEL_REPO}@{FA3_KERNEL_REVISION[:7]} {variant} ({where})"
+        # Some builds ship several copies of the extension; fetch only the one _ops.py loads.
+        lib = re.search(r"from \. import (_flash_attn3_\w+)", ops[0].read_text()).group(1)
+        snapshot_download(allow_patterns=[f"{ops[0].parent.relative_to(root).as_posix()}/{lib}*.so"], **pull)
+        pkg = _find_hub_package(root, rel, "_flash_attn3_")
+        if pkg is None:
+            raise RuntimeError(f"FA3 kernel download for {variant} is incomplete")
+    module = _import_hub_package(pkg, "flash_attn3_hub")
+    return module, f"{FA3_KERNEL_REPO}@{FA3_KERNEL_REVISION[:7]} {variant} ({where})"
 
 
 # Per-request replacement for LongCat's dense attention calls (SageAttention), or None.
@@ -713,19 +823,35 @@ class Runner(BaseRunner):
 
         import longcat_video.modules.avatar.attention as avatar_attention
 
+        self.unavailable = {}  # option -> why its boot self-test failed (shown when requested)
         self.sparse = _SparseAttention(dit, avatar_attention.flash_attn_bsa_3d, _dense_bhsd)
         avatar_attention.flash_attn_bsa_3d = self.sparse.attend
         try:
             print(f"[setup] sparse attention available ({self.sparse.self_test()})")
         except Exception as exc:  # noqa: BLE001 - the input then runs dense
+            self.unavailable["sparse_attention"] = repr(exc)
             print(f"[setup] sparse attention unavailable ({exc!r}); requests run dense")
+        self.fp8_available = False
+        self.fp8_calls = [0]
+        try:
+            fp8_linear = _make_fp8_linear()
+            note = _fp8_self_test(fp8_linear)
+            layers = _install_fp8(dit, fp8_linear, self.fp8_calls)
+            self.fp8_available = True
+            print(f"[setup] FP8 matmuls available on {layers} layers ({note})")
+        except Exception as exc:  # noqa: BLE001 - the input then runs in bf16
+            self.unavailable["fp8_matmuls"] = repr(exc)
+            print(f"[setup] FP8 matmuls unavailable ({exc!r}); requests run in bf16")
         self.sage = _SageAttention()
         if self.attention in ("fa3", "sdpa"):  # Sage plugs into LongCat's FA3 code path
             try:
                 self.sage.kernel, source = _load_sage()
                 print(f"[setup] SageAttention available from {source} ({self.sage.self_test()})")
             except Exception as exc:  # noqa: BLE001 - the input then runs on FA3
+                self.unavailable["sage_attention"] = repr(exc)
                 print(f"[setup] SageAttention unavailable ({exc!r}); requests use {self.attention}")
+        else:
+            self.unavailable["sage_attention"] = f"needs the FA3 code path, attention is {self.attention}"
         # While sparse attention is on, image mode picks sizes from the 128-px bucket table.
         pipe_get_shape = type(self.pipe).get_condition_shape
 
@@ -841,6 +967,13 @@ class Runner(BaseRunner):
             ge=0.0,
             le=0.9375,
         ),
+        fp8_matmuls: bool = Input(
+            description=(
+                "Experimental speed-up: run the video model's big matrix multiplies in FP8 (8-bit) on "
+                "the H100. The picture may differ slightly from the default."
+            ),
+            default=False,
+        ),
         sage_attention: bool = Input(
             description=(
                 "Experimental speed-up: 8-bit attention (SageAttention2) for the video's attention. "
@@ -860,14 +993,24 @@ class Runner(BaseRunner):
         sparse_on = self.sparse.set(float(sparse_attention))
         sage_on = bool(sage_attention) and self.sage.available
         _DENSE_OVERRIDE[0] = self.sage.attend if sage_on else None
+        fp8_on = bool(fp8_matmuls) and self.fp8_available
+        _FP8_ON[0] = fp8_on
+        self.fp8_calls[0] = 0
+        torch.cuda.reset_peak_memory_stats()
+        if fp8_matmuls and not fp8_on:
+            print(f"[predict] FP8 matmuls are unavailable on this machine "
+                  f"({self.unavailable.get('fp8_matmuls', '?')}); running in bf16")
         self.sage.calls = 0
         print(f"[predict] seed={seed} attention={self.attention}"
               + (f" sparse={sparse_attention}" if sparse_on else "")
-              + (" sage=on" if sage_on else ""))
+              + (" sage=on" if sage_on else "")
+              + (" fp8=on" if fp8_on else ""))
         if sage_attention and not sage_on:
-            print("[predict] SageAttention is unavailable on this machine; running without it")
+            print(f"[predict] SageAttention is unavailable on this machine "
+                  f"({self.unavailable.get('sage_attention', '?')}); running without it")
         if sparse_attention > 0 and not sparse_on:
-            print("[predict] sparse attention is unavailable on this machine; running dense")
+            print(f"[predict] sparse attention is unavailable on this machine "
+                  f"({self.unavailable.get('sparse_attention', '?')}); running dense")
 
         self.timer.reset()
         work = self.tmp_root / f"run-{int(t_start * 1000)}"
@@ -1051,6 +1194,9 @@ class Runner(BaseRunner):
             print(f"[predict] write video {self.timer.totals['write video']:.1f}s")
             if sage_on:
                 print(f"[predict] SageAttention: {self.sage.calls} attention calls")
+            if fp8_on:
+                print(f"[predict] FP8 matmuls: {self.fp8_calls[0]} calls")
+            print(f"[predict] peak GPU memory {torch.cuda.max_memory_allocated() / 1e9:.1f} GB")
             if sparse_on:
                 print(f"[predict] sparse attention: {self.sparse.calls['sparse']} sparse / "
                       f"{self.sparse.calls['dense']} dense calls, {frame_w}x{frame_h}")
@@ -1058,6 +1204,7 @@ class Runner(BaseRunner):
             return Path(f"{out_base}.mp4")
         finally:
             _DENSE_OVERRIDE[0] = None
+            _FP8_ON[0] = False
             self.sparse.set(0.0)
             self.kv_cache.release()
             if hasattr(self.pipe, "_clear_cache"):

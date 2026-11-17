@@ -16,17 +16,20 @@ build:
   run:
     # FlashAttention 3: the prebuilt build for this torch from Hugging Face's kernel hub, copied
     # into the image so boots don't depend on that repo (its card says the old "model"-type
-    # kernel repos are being removed). Only the .so that _ops.py loads. Keep the revision in
+    # kernel repos are being removed). Only the .so that _ops.py loads; works with both the
+    # old (build/<variant>/flash_attn3/) and new (build/<variant>/) layouts. Keep the revision in
     # sync with FA3_KERNEL_REVISION in predict.py. If this fails, startup downloads it instead.
     - >-
-      python -c "import re, torch, huggingface_hub as hub;
+      python -c "import re, glob, torch, huggingface_hub as hub;
       major, minor = torch.__version__.split('+')[0].split('.')[:2];
       abi = 'cxx11' if torch._C._GLIBCXX_USE_CXX11_ABI else 'cxx98';
       cu = torch.version.cuda.replace('.', '');
-      pkg = f'build/torch{major}{minor}-{abi}-cu{cu}-x86_64-linux/flash_attn3';
+      rel = f'build/torch{major}{minor}-{abi}-cu{cu}-x86_64-linux';
       kw = dict(repo_id='kernels-community/flash-attn3', revision='e29f138fc363b396e5d2706c8a5f6fa7d36f41e0', local_dir='/opt/flash-attn3');
-      hub.snapshot_download(allow_patterns=[pkg + '/*.py'], **kw);
-      lib = re.search(r'from \. import (_flash_attn3_\w+)', open('/opt/flash-attn3/' + pkg + '/_ops.py').read()).group(1);
+      hub.snapshot_download(allow_patterns=[rel + '/*.py', rel + '/*.json'], **kw);
+      ops = sorted(glob.glob('/opt/flash-attn3/' + rel + '/_ops.py') + glob.glob('/opt/flash-attn3/' + rel + '/*/_ops.py'))[0];
+      lib = re.search(r'from \. import (_flash_attn3_\w+)', open(ops).read()).group(1);
+      pkg = ops.rsplit('/', 1)[0][len('/opt/flash-attn3/'):];
       hub.snapshot_download(allow_patterns=[pkg + '/' + lib + '*.so'], **kw);
       print('FA3 kernel copied into the image:', pkg, lib)"
       || echo "FA3 kernel NOT copied into the image; predict.py will download it at startup"
