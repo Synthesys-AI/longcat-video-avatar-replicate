@@ -1,13 +1,9 @@
 # Mirrors LongCat-Video's requirements.txt + requirements_avatar.txt at commit 58eb336,
-# minus what the avatar path never imports (streamlit, openai, tritonserverclient,
-# torchaudio, the bogus `libsndfile1` pip package — the real lib is an apt package).
-# torch is 2.9 (not the repo's 2.6) because PyTorch's official FlashAttention 3 wheel
-# needs torch>=2.9. FA3 is installed here (hash-pinned), not in cog.yaml `run:` — Cog has
-# no prebuilt base image for CUDA 12.8 / py3.10 / torch 2.9.1, and without one there is
-# no `pip` on PATH for run commands.
-torch==2.9.1
-torchvision==0.24.1
-flash_attn_3 @ https://download.pytorch.org/whl/cu128/flash_attn_3-3.0.1-cp310-abi3-manylinux_2_28_x86_64.whl#sha256=ad5a4df356a786e817dd2ba2e63bb6406dc13d1695fae0b6ba090b8968832ad9
+# minus what the avatar path never imports (streamlit, openai, tritonserverclient, the
+# bogus `libsndfile1` pip package — the real lib is an apt package in cog.yaml).
+torch==2.6.0
+torchvision==0.21.0
+torchaudio==2.6.0
 numpy==1.26.4
 transformers==4.41.0
 diffusers==0.35.1
@@ -30,7 +26,7 @@ scipy==1.15.3
 soundfile==0.13.1
 soxr==0.5.0.post1
 librosa==0.11.0
-sympy==1.13.3
+sympy==1.13.1
 audio-separator==0.30.2
 pyloudnorm==0.1.1
 nvidia-ml-py==13.580.65

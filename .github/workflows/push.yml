@@ -127,7 +127,15 @@ jobs:
           exit 1
 
       - name: Push to Replicate
-        run: cog push "r8.im/${{ steps.model.outputs.full }}"
+        run: |
+          # r8.im sometimes answers a big layer upload with a 502. Pushing again on the same
+          # runner reuses the build cache and skips the layers the registry already has.
+          for attempt in 1 2 3; do
+            if cog push "r8.im/${{ steps.model.outputs.full }}"; then exit 0; fi
+            echo "::warning::cog push attempt $attempt failed"
+            sleep 30
+          done
+          exit 1
 
       - name: Read the new version id
         id: version

@@ -174,21 +174,66 @@ def _sdpa_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q=None, max_seq
     return torch.cat(outs, dim=0)
 
 
-def _install_attention_backend() -> str:
-    """Make `flash_attn_interface` behave the way LongCat's FA3 code path expects.
+# FlashAttention 3 for torch 2.6 comes from Hugging Face's kernel hub (prebuilt per torch /
+# C++ ABI / CUDA combo). PyTorch's own FA3 wheel needs torch>=2.9, which Replicate has no
+# prebuilt base image for, so the image would ship all of torch and take hours to upload.
+FA3_KERNEL_REPO = "kernels-community/flash-attn3"
+FA3_KERNEL_REVISION = "e29f138fc363b396e5d2706c8a5f6fa7d36f41e0"
 
-    LongCat calls `x, *_ = flash_attn_func(...)` and `flash_attn_varlen_func(...)[0]`, i.e. it
-    expects (out, lse) tuples, but FA3 3.x returns just `out` unless return_attn_probs=True.
-    Unwrapped, `[0]` would silently take the first row. So we wrap both to return a tuple.
-    FA3 is self-tested against SDPA first; if it is missing or wrong (e.g. not a Hopper GPU)
-    a pure-PyTorch SDPA module stands in. LONGCAT_ATTENTION=fa3|sdpa forces one.
+
+def _fa3_variant(torch_version: str, cxx11_abi: bool, cuda_version: str) -> str:
+    """The kernel-hub build folder for this torch, e.g. torch26-cxx98-cu124-x86_64-linux."""
+    major, minor = torch_version.split("+")[0].split(".")[:2]
+    return f"torch{major}{minor}-{'cxx11' if cxx11_abi else 'cxx98'}-cu{cuda_version.replace('.', '')}-x86_64-linux"
+
+
+def _load_fa3():
+    """Import FA3: an installed `flash_attn_interface` wheel if present, else the pinned
+    kernel-hub build for this torch (downloaded next to the weights, ~0.8 GB)."""
+    import importlib
+    import re
+
+    try:
+        import flash_attn_interface as fa3
+
+        return fa3, "installed wheel"
+    except ImportError:
+        pass
+
+    from huggingface_hub import snapshot_download
+
+    variant = _fa3_variant(torch.__version__, torch._C._GLIBCXX_USE_CXX11_ABI, torch.version.cuda or "")
+    root = WEIGHTS_ROOT / "flash-attn3"
+    pkg = f"build/{variant}/flash_attn3"
+    pull = dict(repo_id=FA3_KERNEL_REPO, revision=FA3_KERNEL_REVISION, local_dir=str(root))
+    snapshot_download(allow_patterns=[f"{pkg}/*.py"], **pull)
+    ops = root / pkg / "_ops.py"
+    if not ops.exists():
+        raise RuntimeError(f"no FA3 kernel build for {variant}")
+    # The folder holds several builds of the extension; fetch only the one _ops.py loads.
+    lib = re.search(r"from \. import (_flash_attn3_\w+)", ops.read_text()).group(1)
+    snapshot_download(allow_patterns=[f"{pkg}/{lib}*.so"], **pull)
+    sys.path.insert(0, str(root / "build" / variant))
+    return importlib.import_module("flash_attn3"), f"{FA3_KERNEL_REPO}@{FA3_KERNEL_REVISION[:7]} {variant}"
+
+
+def _install_attention_backend() -> str:
+    """Pick the fastest attention that passes a self-test: "fa3", "fa2" or "sdpa".
+
+    FA3 and SDPA both run through LongCat's FA3 code path, which imports
+    `flash_attn_interface` at call time, so we register a module under that name.
+    LongCat calls `x, *_ = flash_attn_func(...)` and `flash_attn_varlen_func(...)[0]`, i.e.
+    it expects (out, lse) tuples. Some FA3 builds return just `out`, where `[0]` would
+    silently take the first row, so both functions are wrapped to always return a tuple.
+    FA2 is LongCat's own FA2 path (the dit's default). LONGCAT_ATTENTION=fa3|fa2|sdpa forces one.
     """
     import types
 
     want = os.environ.get("LONGCAT_ATTENTION", "auto").lower()
     if want in ("auto", "fa3"):
         try:
-            import flash_attn_interface as fa3
+            t0 = time.time()
+            fa3, source = _load_fa3()
 
             g = torch.Generator(device="cuda").manual_seed(0)
             q, k, v = (
@@ -219,31 +264,44 @@ def _install_attention_backend() -> str:
             err = max(err, err_v)
 
             raw_func, raw_varlen = fa3.flash_attn_func, fa3.flash_attn_varlen_func
+            shim = types.ModuleType("flash_attn_interface")
 
             def flash_attn_func(*args, **kwargs):
                 res = raw_func(*args, **kwargs)
-                return res if isinstance(res, tuple) else (res, None)
+                return tuple(res) if isinstance(res, (tuple, list)) else (res, None)
 
             def flash_attn_varlen_func(*args, **kwargs):
                 res = raw_varlen(*args, **kwargs)
-                return res if isinstance(res, tuple) else (res, None)
+                return tuple(res) if isinstance(res, (tuple, list)) else (res, None)
 
-            fa3.flash_attn_func = flash_attn_func
-            fa3.flash_attn_varlen_func = flash_attn_varlen_func
-            print(f"[setup] attention: FlashAttention 3 (self-test max err {err:.4f})")
+            shim.flash_attn_func = flash_attn_func
+            shim.flash_attn_varlen_func = flash_attn_varlen_func
+            sys.modules["flash_attn_interface"] = shim
+            print(f"[setup] attention: FlashAttention 3 from {source} "
+                  f"(self-test max err {err:.4f}, {time.time() - t0:.0f}s)")
             return "fa3"
         except Exception as exc:  # noqa: BLE001 - any failure means "use the fallback"
             if want == "fa3":
                 raise
-            print(f"[setup] attention: FlashAttention 3 unavailable ({exc!r}); using PyTorch SDPA")
+            print(f"[setup] attention: FlashAttention 3 unavailable ({exc!r})")
+
+    if want in ("auto", "fa2"):
+        try:
+            import flash_attn  # noqa: F401 - LongCat's FA2 path imports it at call time
+
+            print(f"[setup] attention: FlashAttention 2 ({flash_attn.__version__})")
+            return "fa2"
+        except Exception as exc:  # noqa: BLE001
+            if want == "fa2":
+                raise
+            print(f"[setup] attention: FlashAttention 2 unavailable ({exc!r})")
 
     shim = types.ModuleType("flash_attn_interface")
     shim.flash_attn_func = lambda q, k, v, softmax_scale=None, causal=False, **_: (
         _sdpa(q, k, v, softmax_scale=softmax_scale, causal=causal), None)
     shim.flash_attn_varlen_func = lambda *a, **kw: (_sdpa_varlen(*a, **kw), None)
     sys.modules["flash_attn_interface"] = shim
-    if want == "sdpa":
-        print("[setup] attention: PyTorch SDPA (forced)")
+    print("[setup] attention: PyTorch SDPA" + (" (forced)" if want == "sdpa" else ""))
     return "sdpa"
 
 
@@ -284,8 +342,7 @@ class Runner(BaseRunner):
         )
         cp_split_hw = context_parallel_util.get_optimal_split(1)
         self.device = 0
-        # Both backends are reached through LongCat's FA3 code path (the SDPA fallback
-        # registers itself as `flash_attn_interface`), so FA2 is not needed at all.
+        # FA3 and the SDPA fallback both go through LongCat's FA3 code path; FA2 is its own.
         self.attention = _install_attention_backend()
 
         tokenizer = AutoTokenizer.from_pretrained(str(BASE_DIR), subfolder="tokenizer")
@@ -303,8 +360,8 @@ class Runner(BaseRunner):
             str(AVATAR_DIR),
             subfolder="base_model",
             cp_split_hw=cp_split_hw,
-            enable_flashattn3=True,
-            enable_flashattn2=False,
+            enable_flashattn3=self.attention in ("fa3", "sdpa"),
+            enable_flashattn2=self.attention == "fa2",
             torch_dtype=torch.bfloat16,
         ).to(self.device)
         dit.load_lora(

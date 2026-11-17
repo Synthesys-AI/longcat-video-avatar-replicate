@@ -14,7 +14,7 @@ This follows the model card's 1.6 recipe on one GPU:
 - DMD/OPSD LoRA mix, `mix_steps=4` and `mix_alpha=1.0` by default.
 - Whisper-large-v3 audio features and Kim_Vocal_2 voice isolation.
 - 25 fps output, muxed with your original audio.
-- FlashAttention 3 on the H100. This is PyTorch's official build, which is why torch is 2.9 rather than Meituan's pinned 2.6. It is self-tested against PyTorch SDPA at startup, and SDPA takes over automatically if FA3 fails. Set `LONGCAT_ATTENTION=fa3|sdpa` to force one or the other.
+- FlashAttention 3 on the H100, from a pinned prebuilt torch 2.6 build on Hugging Face's kernel hub (`kernels-community/flash-attn3`), fetched at startup. PyTorch's own FA3 wheel needs torch 2.9, and Replicate has no prebuilt base image for that, so the image would carry all of torch and take hours to upload. FA3 is self-tested against PyTorch SDPA at startup. If it fails, FlashAttention 2 takes over, then SDPA. Set `LONGCAT_ATTENTION=fa3|fa2|sdpa` to force one.
 
 Meituan's inference code is cloned at a pinned commit, `58eb336`, when the image is built.
 The weights, about 63 GB from pinned Hugging Face revisions, download in `setup()` when a

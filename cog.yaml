@@ -4,7 +4,7 @@
 # Written for Cog v0.23 (BaseRunner / run()).
 build:
   gpu: true
-  cuda: "12.8"
+  cuda: "12.4"
   python_version: "3.10"
   system_packages:
     - ffmpeg
@@ -12,8 +12,10 @@ build:
     - git
   python_requirements: requirements.txt
   run:
-    # (FlashAttention 3 is installed from requirements.txt; predict.py self-tests it at
-    # startup and falls back to PyTorch SDPA.)
+    # FlashAttention 3 is not installed here: predict.py loads a prebuilt torch 2.6 build from
+    # Hugging Face's kernel hub at startup. FA2 below is the fallback if FA3 fails its self-test.
+    # Prebuilt FlashAttention-2 for torch 2.6 / CUDA 12 / py3.10 (PyPI torch 2.6 uses the old C++ ABI).
+    - pip install --no-deps "https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.4.post1/flash_attn-2.7.4.post1+cu12torch2.6cxx11abiFALSE-cp310-cp310-linux_x86_64.whl"
     # Meituan's inference code, pinned to the commit this predictor was written against.
     - git clone https://github.com/meituan-longcat/LongCat-Video /opt/LongCat-Video && cd /opt/LongCat-Video && git checkout 58eb336edc5c8c63389838727e40b8c18434e54e && rm -rf .git
 run: "predict.py:Runner"

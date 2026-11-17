@@ -13,9 +13,9 @@ SRC = pathlib.Path(__file__).resolve().parents[1] / "predict.py"
 _tree = ast.parse(SRC.read_text())
 _ns = {"torch": torch}
 for node in _tree.body:
-    if isinstance(node, ast.FunctionDef) and node.name in {"_sdpa", "_sdpa_varlen"}:
+    if isinstance(node, ast.FunctionDef) and node.name in {"_sdpa", "_sdpa_varlen", "_fa3_variant"}:
         exec(compile(ast.Module([node], []), str(SRC), "exec"), _ns)
-_sdpa, _sdpa_varlen = _ns["_sdpa"], _ns["_sdpa_varlen"]
+_sdpa, _sdpa_varlen, _fa3_variant = _ns["_sdpa"], _ns["_sdpa_varlen"], _ns["_fa3_variant"]
 
 
 def naive(q, k, v, scale):  # q: [S, H, D], k/v: [T, H, D]
@@ -52,6 +52,13 @@ def test_longcat_call_patterns_on_tuple_wrapped_results():
     assert y.shape == (12, 2, 8)
     # The bug the wrapper prevents: indexing a bare tensor drops a dimension.
     assert _sdpa_varlen(q[0], q[0], q[0], cu, cu, softmax_scale=0.3)[0].shape == (2, 8)
+
+
+def test_fa3_variant_names_match_kernel_hub_folders():
+    # The image's torch 2.6 PyPI wheel (CUDA 12.4, old C++ ABI) and a couple of others.
+    assert _fa3_variant("2.6.0+cu124", False, "12.4") == "torch26-cxx98-cu124-x86_64-linux"
+    assert _fa3_variant("2.8.0", True, "12.8") == "torch28-cxx11-cu128-x86_64-linux"
+    assert _fa3_variant("2.10.1+cu130", True, "13.0") == "torch210-cxx11-cu130-x86_64-linux"
 
 
 if __name__ == "__main__":
