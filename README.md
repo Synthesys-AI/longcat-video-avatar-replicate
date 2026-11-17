@@ -30,8 +30,9 @@ machine first boots. That keeps the image small enough to build on a GitHub runn
 | `isolate_voice` | Strips music or noise before lip-sync. The output keeps the original audio. |
 | `mix_steps`, `mix_alpha` | The LoRA mix. Leave these at the defaults unless faces distort. |
 | `seed` | Use it to reproduce a run. |
+| `sparse_attention` | Experimental, off by default. The share of attention to skip (e.g. `0.75`), using LongCat's block-sparse kernel. While it is on, frame sizes snap to 128 px blocks (16:9 at 480p renders at 896×512, not 832×480). Faces or lip-sync may soften. |
 
-On one H100 with FlashAttention 3, 480p takes about 50 s per 3.2 s of new video (58.6 s with FlashAttention 2), so 8 s of video takes about 3.3 min. A cold start adds about 4 min while the weights download. Replicate stops any prediction after 30 minutes. The predictor stops starting new segments
+On one H100 with FlashAttention 3, 480p takes about 49 s for the first 3.7 s of video and 45 s per 3.2 s after that (50 s before carried-frame reuse, 58.6 s with FlashAttention 2). An 8 s clip takes about 3.2 min; 82 s should take about 21 min. A cold start adds about 4 min while the weights download. Replicate stops any prediction after 30 minutes. The predictor stops starting new segments
 before it hits that limit and returns the video made so far, and the logs say so.
 
 ## Publishing

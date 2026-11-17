@@ -18,6 +18,10 @@ on:
         description: "Test length in seconds (max_duration; the demo speech is 82 s long)"
         required: false
         default: "8"
+      sparse_attention:
+        description: "sparse_attention input (empty = the model's default)"
+        required: false
+        default: ""
 
 jobs:
   smoke:
@@ -33,6 +37,7 @@ jobs:
           NAME: ${{ inputs.model_name }}
           PREDICTION_ID: ${{ inputs.prediction_id }}
           SMOKE_SECONDS: ${{ inputs.seconds }}
+          SMOKE_SPARSITY: ${{ inputs.sparse_attention }}
           WAIT_MINUTES: "70"
         run: |
           set -euo pipefail

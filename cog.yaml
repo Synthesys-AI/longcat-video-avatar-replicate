@@ -10,6 +10,8 @@ build:
     - ffmpeg
     - libsndfile1
     - git
+    # Triton builds its kernel launcher with a C compiler (sparse attention's kernels).
+    - build-essential
   python_requirements: requirements.txt
   run:
     # FlashAttention 3 is not installed here: predict.py loads a prebuilt torch 2.6 build from

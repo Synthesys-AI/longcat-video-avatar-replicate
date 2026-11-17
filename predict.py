@@ -28,6 +28,9 @@ from typing import Optional
 
 os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+# LongCat wraps the small sparse-attention helpers (block pooling, top-k) in torch.compile.
+# Eager they cost milliseconds; compiled, every new frame size would recompile mid-prediction.
+os.environ.setdefault("TORCH_COMPILE_DISABLE", "1")
 
 import numpy as np
 import PIL.Image
@@ -112,6 +115,17 @@ TEXT_MODE_SIZES = {
     "720p": {"16:9": (768, 1280), "9:16": (1280, 768), "1:1": (960, 960)},
 }
 
+# Experimental block-sparse attention (LongCat's own Triton kernel, `sparse_attention` input).
+# A block is one latent frame by 8x8 latent tokens (128x128 px); each block of queries
+# attends only to the top (1 - sparsity) share of key blocks. Frame sizes must divide into
+# 128-px blocks, so while it is on, sizes come from LongCat's 128-px bucket table.
+SPARSE_CHUNK = (1, 8, 8)
+SPARSE_MIN_QUERY_FRAMES = 8  # the reference/carried-frame attentions (1-5 frames) stay dense
+TEXT_MODE_SIZES_SPARSE = {
+    "480p": {"16:9": (512, 896), "9:16": (896, 512), "1:1": (640, 640)},
+    "720p": {"16:9": (768, 1280), "9:16": (1280, 768), "1:1": (1024, 1024)},
+}
+
 
 def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -177,6 +191,72 @@ class _MixAwareKVCache:
         self._built_for = None
         if getattr(self.pipe, "kv_cache_dict", None) is self.live:
             self.pipe.kv_cache_dict = None
+
+
+def _dense_bhsd(q, k, v):
+    """Dense attention on [B, H, S, D] tensors: FA3 (or its SDPA stand-in) when registered."""
+    fa = sys.modules.get("flash_attn_interface")
+    if fa is None:
+        return torch.nn.functional.scaled_dot_product_attention(q, k, v)
+    out = fa.flash_attn_func(
+        q.transpose(1, 2).contiguous(), k.transpose(1, 2).contiguous(), v.transpose(1, 2).contiguous(),
+        softmax_scale=q.shape[-1] ** -0.5,
+    )[0]
+    return out.transpose(1, 2)
+
+
+class _SparseAttention:
+    """Routes LongCat's block-sparse attention calls: sparse for the big video attention,
+    dense for small or non-tiling shapes. Off unless a request sets a sparsity."""
+
+    def __init__(self, dit, bsa_3d, dense_fn):
+        self.dit, self.bsa_3d, self.dense_fn = dit, bsa_3d, dense_fn
+        self.available = False
+        self.sparsity = 0.0
+        self.calls = {"sparse": 0, "dense": 0}
+
+    @staticmethod
+    def fits(latent_shape) -> bool:
+        return all(n % c == 0 for n, c in zip(latent_shape, SPARSE_CHUNK))
+
+    def attend(self, q, k, v, latent_shape_q, latent_shape_k, sparsity=0.0, **_):
+        if (latent_shape_q[0] >= SPARSE_MIN_QUERY_FRAMES
+                and self.fits(latent_shape_q) and self.fits(latent_shape_k)):
+            self.calls["sparse"] += 1
+            chunk = list(SPARSE_CHUNK)
+            return self.bsa_3d(q, k, v, latent_shape_q, latent_shape_k, sparsity=float(sparsity),
+                               chunk_3d_shape_q=chunk, chunk_3d_shape_k=chunk)
+        self.calls["dense"] += 1
+        return self.dense_fn(q, k, v)
+
+    def set(self, sparsity: float) -> bool:
+        on = self.available and sparsity > 0
+        self.sparsity = float(sparsity) if on else 0.0
+        for block in self.dit.blocks:
+            block.attn.enable_bsa = on
+            block.attn.bsa_params = {"sparsity": self.sparsity} if on else None
+        self.calls = {"sparse": 0, "dense": 0}
+        return on
+
+    def self_test(self) -> str:
+        """Sparsity 0 keeps every block, so the kernel must match dense attention, including
+        more keys than queries (a continuation chunk). Also checks a sparse call runs."""
+        g = torch.Generator(device="cuda").manual_seed(0)
+        shape_q, shape_k = (8, 16, 16), (12, 16, 16)
+        def rnd(shape):
+            return torch.randn(1, 4, shape[0] * shape[1] * shape[2], 128, device="cuda",
+                               dtype=torch.bfloat16, generator=g)
+        q, k, v = rnd(shape_q), rnd(shape_k), rnd(shape_k)
+        chunk = list(SPARSE_CHUNK)
+        out = self.bsa_3d(q, k, v, shape_q, shape_k, sparsity=0.0, chunk_3d_shape_q=chunk, chunk_3d_shape_k=chunk)
+        err = (out.float() - self.dense_fn(q, k, v).float()).abs().max().item()
+        if out.shape != q.shape or not err < 2e-2:
+            raise RuntimeError(f"self-test mismatch: shape {tuple(out.shape)}, max err {err:.4f}")
+        sparse = self.bsa_3d(q, k, v, shape_q, shape_k, sparsity=0.875, chunk_3d_shape_q=chunk, chunk_3d_shape_k=chunk)
+        if not torch.isfinite(sparse).all():
+            raise RuntimeError("sparse output is not finite")
+        self.available = True
+        return f"self-test max err {err:.4f}"
 
 
 def _segments_for(duration: float) -> int:
@@ -468,6 +548,24 @@ class Runner(BaseRunner):
         )
         self.pipe.to(self.device)
         self.kv_cache = _MixAwareKVCache(self.pipe)
+
+        import longcat_video.modules.avatar.attention as avatar_attention
+
+        self.sparse = _SparseAttention(dit, avatar_attention.flash_attn_bsa_3d, _dense_bhsd)
+        avatar_attention.flash_attn_bsa_3d = self.sparse.attend
+        try:
+            print(f"[setup] sparse attention available ({self.sparse.self_test()})")
+        except Exception as exc:  # noqa: BLE001 - the input then runs dense
+            print(f"[setup] sparse attention unavailable ({exc!r}); requests run dense")
+        # While sparse attention is on, image mode picks sizes from the 128-px bucket table.
+        pipe_get_shape = type(self.pipe).get_condition_shape
+
+        def get_condition_shape(condition, resolution, scale_factor_spatial=32):
+            if self.sparse.sparsity > 0:
+                scale_factor_spatial = max(scale_factor_spatial, 128)
+            return pipe_get_shape(self.pipe, condition, resolution, scale_factor_spatial=scale_factor_spatial)
+
+        self.pipe.get_condition_shape = get_condition_shape
         print(
             f"[setup] ready in {time.time() - t_setup:.0f}s, "
             f"{torch.cuda.memory_allocated() / 1e9:.1f} GB on GPU"
@@ -519,6 +617,16 @@ class Runner(BaseRunner):
             le=1.0,
         ),
         seed: Optional[int] = Input(description="Random seed. Leave empty for a random one.", default=None),
+        sparse_attention: float = Input(
+            description=(
+                "Experimental speed-up: the share of attention to skip, e.g. 0.75 or 0.875. 0 = off. "
+                "While on, frame sizes snap to 128 px blocks (16:9 at 480p renders at 896x512). "
+                "May soften faces or lip-sync."
+            ),
+            default=0.0,
+            ge=0.0,
+            le=0.9375,
+        ),
     ) -> Path:
         from diffusers.utils import load_image
 
@@ -528,7 +636,11 @@ class Runner(BaseRunner):
         t_start = time.time()
         if seed is None:
             seed = secrets.randbelow(2**31)
-        print(f"[predict] seed={seed} attention={self.attention}")
+        sparse_on = self.sparse.set(float(sparse_attention))
+        print(f"[predict] seed={seed} attention={self.attention}"
+              + (f" sparse={sparse_attention}" if sparse_on else ""))
+        if sparse_attention > 0 and not sparse_on:
+            print("[predict] sparse attention is unavailable on this machine; running dense")
 
         work = self.tmp_root / f"run-{int(t_start * 1000)}"
         work.mkdir(parents=True, exist_ok=True)
@@ -615,7 +727,8 @@ class Runner(BaseRunner):
                     **common,
                 )
             else:
-                height, width = TEXT_MODE_SIZES[resolution][aspect_ratio]
+                sizes = TEXT_MODE_SIZES_SPARSE if sparse_on else TEXT_MODE_SIZES
+                height, width = sizes[resolution][aspect_ratio]
                 output, latent = self.pipe.generate_at2v(
                     height=height,
                     width=width,
@@ -687,9 +800,13 @@ class Runner(BaseRunner):
             save_video_ffmpeg(
                 torch.from_numpy(frames[:n_out]), str(out_base), str(speech_wav), fps=FPS, quality=10
             )
+            if sparse_on:
+                print(f"[predict] sparse attention: {self.sparse.calls['sparse']} sparse / "
+                      f"{self.sparse.calls['dense']} dense calls, {frame_w}x{frame_h}")
             print(f"[predict] done in {time.time() - t_start:.0f}s")
             return Path(f"{out_base}.mp4")
         finally:
+            self.sparse.set(0.0)
             self.kv_cache.release()
             if hasattr(self.pipe, "_clear_cache"):
                 self.pipe._clear_cache()
