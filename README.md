@@ -38,6 +38,10 @@ before it hits that limit and returns the video made so far, and the logs say so
 
 The last segment only generates the frames the audio still needs (rounded up to 4k+1), rather than a full 3.2 s that would mostly be trimmed; a clip under 3.7 s is a single short segment. The logs time each phase: audio prep, then per segment the DiT steps, VAE encode/decode, text encoding and everything else.
 
+## Trying your own files
+
+`scripts/run_local.sh <image> <audio> [prompt] [extra input JSON]` uploads both files to your Replicate account (Files API, private), runs the latest version on the whole recording and saves `<audio>-longcat.mp4` next to the audio. It reads `REPLICATE_API_TOKEN`, or asks for it without echoing it. `DRY_RUN=1` shows the request instead.
+
 ## Publishing
 
 Pushes go through `.github/workflows/push.yml` (it installs Cog v0.23.1 itself), started from the Actions tab with "Run workflow":
