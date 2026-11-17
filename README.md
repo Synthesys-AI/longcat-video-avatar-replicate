@@ -39,7 +39,7 @@ Pushes go through `.github/workflows/push.yml` (it installs Cog v0.23.1 itself),
 2. It builds the image and pushes it.
 3. It can run an 8-second test prediction.
 
-It needs one repository secret, `REPLICATE_API_TOKEN`.
+It needs two repository secrets. `REPLICATE_API_TOKEN` comes from replicate.com/account/api-tokens and is used for API calls. `REPLICATE_CLI_AUTH_TOKEN` comes from replicate.com/auth/token and is used for `cog login`, which rejects API tokens.
 
 ## Licence
 

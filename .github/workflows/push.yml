@@ -4,7 +4,9 @@ name: Push to Replicate
 # on Replicate as PUBLIC if it doesn't exist yet, pushes a new version, and can run a
 # short test prediction against it.
 #
-# Needs one repository secret: REPLICATE_API_TOKEN (replicate.com/account/api-tokens).
+# Needs two repository secrets:
+#   REPLICATE_API_TOKEN       replicate.com/account/api-tokens  (API calls: create model, test run)
+#   REPLICATE_CLI_AUTH_TOKEN  replicate.com/auth/token          (cog login; Cog rejects API tokens)
 
 on:
   workflow_dispatch:
@@ -91,15 +93,18 @@ jobs:
       - name: Install Cog and log in to Replicate
         env:
           COG_VERSION: v0.23.1
-          REPLICATE_API_TOKEN: ${{ secrets.REPLICATE_API_TOKEN }}
+          REPLICATE_CLI_AUTH_TOKEN: ${{ secrets.REPLICATE_CLI_AUTH_TOKEN }}
         run: |
           set -euo pipefail
+          if [ -z "${REPLICATE_CLI_AUTH_TOKEN}" ]; then
+            echo "Missing repository secret REPLICATE_CLI_AUTH_TOKEN (copy it from https://replicate.com/auth/token)"; exit 1
+          fi
           sudo curl -fsSL -o /usr/local/bin/cog \
             "https://github.com/replicate/cog/releases/download/${COG_VERSION}/cog_$(uname -s)_$(uname -m)"
           sudo chmod +x /usr/local/bin/cog
           cog --version
           docker version --format 'docker {{.Server.Version}}'
-          printf '%s' "$REPLICATE_API_TOKEN" | cog login --token-stdin
+          printf '%s' "$REPLICATE_CLI_AUTH_TOKEN" | cog login --token-stdin
 
       - name: Push to Replicate
         run: cog push "r8.im/${{ steps.model.outputs.full }}"
