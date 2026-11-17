@@ -90,21 +90,41 @@ jobs:
           echo "Created:"; jq '{url, visibility}' created.json
 
       # replicate/setup-cog was removed from GitHub, so install a pinned Cog release directly.
+      # `cog login` = POST r8.im/cog/v1/verify-token (-> username) + `docker login r8.im`,
+      # but it refuses any token starting with r8_ before asking Replicate. We do the same
+      # two steps ourselves and let Replicate's verify endpoint decide.
       - name: Install Cog and log in to Replicate
         env:
           COG_VERSION: v0.23.1
-          REPLICATE_CLI_AUTH_TOKEN: ${{ secrets.REPLICATE_CLI_AUTH_TOKEN }}
+          CLI_TOKEN: ${{ secrets.REPLICATE_CLI_AUTH_TOKEN }}
+          API_TOKEN: ${{ secrets.REPLICATE_API_TOKEN }}
         run: |
           set -euo pipefail
-          if [ -z "${REPLICATE_CLI_AUTH_TOKEN}" ]; then
-            echo "Missing repository secret REPLICATE_CLI_AUTH_TOKEN (copy it from https://replicate.com/auth/token)"; exit 1
-          fi
           sudo curl -fsSL -o /usr/local/bin/cog \
             "https://github.com/replicate/cog/releases/download/${COG_VERSION}/cog_$(uname -s)_$(uname -m)"
           sudo chmod +x /usr/local/bin/cog
           cog --version
           docker version --format 'docker {{.Server.Version}}'
-          printf '%s' "$REPLICATE_CLI_AUTH_TOKEN" | cog login --token-stdin
+
+          describe() { case "$1" in r8_*) echo "API-style (r8_), ${#1} chars" ;; "") echo "empty" ;; *) echo "CLI-style, ${#1} chars" ;; esac; }
+          echo "REPLICATE_CLI_AUTH_TOKEN: $(describe "${CLI_TOKEN}")"
+          [ -n "${CLI_TOKEN}" ] && [ "${CLI_TOKEN}" = "${API_TOKEN}" ] && echo "NOTE: REPLICATE_CLI_AUTH_TOKEN is identical to REPLICATE_API_TOKEN"
+
+          login_with() {
+            local token="$1" code user
+            code=$(curl -s -o verify.json -w '%{http_code}' -X POST --data-urlencode "token=${token}" https://r8.im/cog/v1/verify-token)
+            if [ "$code" != "200" ]; then echo "  r8.im verify-token: HTTP $code"; return 1; fi
+            user=$(jq -r .username verify.json); rm -f verify.json
+            printf '%s' "$token" | docker login r8.im --username "$user" --password-stdin >/dev/null
+            echo "Logged in to r8.im as $user"
+          }
+          for t in "${CLI_TOKEN}" "${API_TOKEN}"; do
+            [ -n "$t" ] || continue
+            if login_with "$t"; then exit 0; fi
+          done
+          echo "Replicate rejected both tokens for pushing. Copy the token shown at https://replicate.com/auth/token"
+          echo "(signed in as the synthesys-ai account) into the REPLICATE_CLI_AUTH_TOKEN secret."
+          exit 1
 
       - name: Push to Replicate
         run: cog push "r8.im/${{ steps.model.outputs.full }}"
