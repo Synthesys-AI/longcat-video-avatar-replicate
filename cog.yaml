@@ -1,6 +1,7 @@
 # Cog package for meituan-longcat/LongCat-Video-Avatar-1.6 (MIT).
 # Weights are NOT baked into the image: setup() downloads the pinned Hugging Face
 # revisions (~63 GB) on first boot of each machine. See predict.py.
+# Written for Cog v0.23 (BaseRunner / run()).
 build:
   gpu: true
   cuda: "12.4"
@@ -15,4 +16,4 @@ build:
     - pip install --no-deps "https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.4.post1/flash_attn-2.7.4.post1+cu12torch2.6cxx11abiFALSE-cp310-cp310-linux_x86_64.whl"
     # Meituan's inference code, pinned to the commit this predictor was written against.
     - git clone https://github.com/meituan-longcat/LongCat-Video /opt/LongCat-Video && cd /opt/LongCat-Video && git checkout 58eb336edc5c8c63389838727e40b8c18434e54e && rm -rf .git
-predict: "predict.py:Predictor"
+run: "predict.py:Runner"

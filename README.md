@@ -34,7 +34,7 @@ before it hits that limit and returns the video made so far, and the logs say so
 
 ## Publishing
 
-Pushes go through `.github/workflows/push.yml`, started from the Actions tab with "Run workflow":
+Pushes go through `.github/workflows/push.yml` (it installs Cog v0.23.1 itself), started from the Actions tab with "Run workflow":
 1. It creates the model on Replicate as **public** if it doesn't exist yet, on `gpu-h100`.
 2. It builds the image and pushes it.
 3. It can run an 8-second test prediction.

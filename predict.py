@@ -1,7 +1,7 @@
-"""Replicate (Cog) predictor for LongCat-Video-Avatar 1.6.
+"""Replicate (Cog) runner for LongCat-Video-Avatar 1.6.
 
 A port of Meituan's `run_demo_avatar_single_audio_to_video.py` (LongCat-Video @ 58eb336)
-to a long-lived single-GPU predictor:
+to a long-lived single-GPU Cog runner:
 
   * one process, context-parallel size 1 (the demo's torchrun with nproc_per_node=1);
   * the 1.6 recipe from the model card: distilled 8-step sampling with the DMD (loraA)
@@ -33,7 +33,7 @@ import numpy as np
 import PIL.Image
 import torch
 import torch.distributed as dist
-from cog import BasePredictor, Input, Path
+from cog import BaseRunner, Input, Path
 
 LONGCAT_SRC = "/opt/LongCat-Video"
 if LONGCAT_SRC not in sys.path:
@@ -152,7 +152,7 @@ def _download_weights() -> None:
         print(f"[setup] downloaded {repo}@{revision[:8]} in {time.time() - t0:.0f}s")
 
 
-class Predictor(BasePredictor):
+class Runner(BaseRunner):
     def setup(self) -> None:
         t_setup = time.time()
         _download_weights()
@@ -259,7 +259,7 @@ class Predictor(BasePredictor):
             f"{torch.cuda.memory_allocated() / 1e9:.1f} GB on GPU"
         )
 
-    def predict(
+    def run(
         self,
         audio: Path = Input(
             description="Speech for the avatar to say (mp3, wav, m4a, or a video file). The video lasts as long as the audio, up to max_duration.",
