@@ -71,7 +71,7 @@ jobs:
           body=$(jq -n --arg owner "$owner" --arg name "$name" --arg hw "$HARDWARE" '{
             owner: $owner, name: $name, visibility: "public", hardware: $hw,
             description: "LongCat-Video-Avatar 1.6 by Meituan: audio-driven talking avatar video from speech plus an image or a text prompt, with long-form continuation.",
-            github_url: "https://github.com/flipkast/longcat-video-avatar-replicate",
+            github_url: "https://github.com/Synthesys-AI/longcat-video-avatar-replicate",
             paper_url: "https://github.com/meituan-longcat/LongCat-Video/blob/main/assets/LongCat-Video-Avatar-1.6-Tech-Report.pdf",
             license_url: "https://huggingface.co/meituan-longcat/LongCat-Video-Avatar-1.6"
           }')
