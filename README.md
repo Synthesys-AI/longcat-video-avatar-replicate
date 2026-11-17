@@ -30,7 +30,8 @@ machine first boots. That keeps the image small enough to build on a GitHub runn
 | `isolate_voice` | Strips music or noise before lip-sync. The output keeps the original audio. |
 | `mix_steps`, `mix_alpha` | The LoRA mix. Leave these at the defaults unless faces distort. |
 | `seed` | Use it to reproduce a run. |
-| `sage_attention` | Experimental, off by default. 8-bit attention (SageAttention2, from the same kernel hub) for the video's attention. Frame sizes stay the same; the picture may differ slightly from the default. |
+| `sage_attention` | Experimental, off by default. 8-bit attention (SageAttention2, from the same kernel hub) for the video's attention. Frame sizes stay the same; the picture may differ slightly from the default. Measured on an 8 s clip: about 2.5% faster, video nearly identical (SSIM 0.97). |
+| `fp8_matmuls` | Experimental, off by default. FP8 for the DiT's big matrix multiplies on the H100. Measured on an 8 s clip: about 5% faster (6.6% with `sage_attention`), small visual differences (SSIM 0.90), same lip timing. |
 | `sparse_attention` | Experimental, off by default. The share of attention to skip (e.g. `0.75`), using LongCat's block-sparse kernel. While it is on, frame sizes snap to 128 px blocks (16:9 at 480p renders at 896×512, not 832×480). Faces or lip-sync may soften. |
 
 On one H100 with FlashAttention 3, 480p takes about 49 s for the first 3.7 s of video and 45 s per 3.2 s after that (50 s before carried-frame reuse, 58.6 s with FlashAttention 2). Almost all of that is the DiT's denoising steps (about 41 s of a 44 s segment); VAE decode is about 2 s. An 8 s clip takes about 2.3 min, even on a freshly booted machine, because setup warms up the audio prep. 82 s should take about 19 min. A cold start adds about 4 min while the weights download. Replicate stops any prediction after 30 minutes. The predictor stops starting new segments
