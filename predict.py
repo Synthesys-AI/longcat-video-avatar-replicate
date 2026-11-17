@@ -14,6 +14,8 @@ to a long-lived single-GPU Cog runner:
 Weights (~63 GB) are downloaded from pinned Hugging Face revisions in setup().
 """
 
+import collections
+import functools
 import math
 import os
 import secrets
@@ -23,6 +25,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from contextlib import contextmanager
 from pathlib import Path as FsPath
 from typing import Optional
 
@@ -136,6 +139,48 @@ def _free_port() -> int:
 def _torch_gc() -> None:
     torch.cuda.empty_cache()
     torch.cuda.ipc_collect()
+
+
+class _PhaseTimer:
+    """Adds up GPU-synchronised wall time per named phase, so the logs show where a
+    prediction's time goes (DiT steps vs. VAE vs. CPU work between them)."""
+
+    def __init__(self, sync=None):
+        self.sync = sync or (lambda: None)
+        self.totals = collections.defaultdict(float)
+
+    def reset(self) -> None:
+        self.totals.clear()
+
+    def snapshot(self) -> dict:
+        return dict(self.totals)
+
+    @contextmanager
+    def phase(self, name: str):
+        self.sync()
+        t0 = time.perf_counter()
+        try:
+            yield
+        finally:
+            self.sync()
+            self.totals[name] += time.perf_counter() - t0
+
+    def wrap(self, obj, attr: str, name: str) -> None:
+        fn = getattr(obj, attr)
+
+        @functools.wraps(fn)  # keeps the signature visible to anything that inspects it
+        def timed(*args, **kwargs):
+            with self.phase(name):
+                return fn(*args, **kwargs)
+
+        setattr(obj, attr, timed)
+
+    @staticmethod
+    def breakdown(before: dict, after: dict, total: float) -> str:
+        diff = {k: after.get(k, 0.0) - before.get(k, 0.0) for k in after}
+        parts = [f"{k} {v:.1f}s" for k, v in sorted(diff.items(), key=lambda kv: -kv[1]) if v >= 0.05]
+        parts.append(f"other {max(0.0, total - sum(diff.values())):.1f}s")
+        return ", ".join(parts)
 
 
 class _MixAwareKVCache:
@@ -314,7 +359,11 @@ def _sdpa_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q=None, max_seq
 # C++ ABI / CUDA combo). PyTorch's own FA3 wheel needs torch>=2.9, which Replicate has no
 # prebuilt base image for, so the image would ship all of torch and take hours to upload.
 FA3_KERNEL_REPO = "kernels-community/flash-attn3"
-FA3_KERNEL_REVISION = "e29f138fc363b396e5d2706c8a5f6fa7d36f41e0"
+FA3_KERNEL_REVISION = "e29f138fc363b396e5d2706c8a5f6fa7d36f41e0"  # keep in sync with cog.yaml
+# cog.yaml copies this build into the image, so boots don't depend on the Hugging Face repo
+# (its card says the old "model"-type kernel repos are being removed). Startup still
+# downloads it if the copy is missing.
+FA3_BAKED_DIR = FsPath("/opt/flash-attn3")
 
 
 def _fa3_variant(torch_version: str, cxx11_abi: bool, cuda_version: str) -> str:
@@ -339,18 +388,30 @@ def _load_fa3():
     from huggingface_hub import snapshot_download
 
     variant = _fa3_variant(torch.__version__, torch._C._GLIBCXX_USE_CXX11_ABI, torch.version.cuda or "")
-    root = WEIGHTS_ROOT / "flash-attn3"
     pkg = f"build/{variant}/flash_attn3"
-    pull = dict(repo_id=FA3_KERNEL_REPO, revision=FA3_KERNEL_REVISION, local_dir=str(root))
-    snapshot_download(allow_patterns=[f"{pkg}/*.py"], **pull)
-    ops = root / pkg / "_ops.py"
-    if not ops.exists():
-        raise RuntimeError(f"no FA3 kernel build for {variant}")
-    # The folder holds several builds of the extension; fetch only the one _ops.py loads.
-    lib = re.search(r"from \. import (_flash_attn3_\w+)", ops.read_text()).group(1)
-    snapshot_download(allow_patterns=[f"{pkg}/{lib}*.so"], **pull)
+    lib_re = r"from \. import (_flash_attn3_\w+)"
+
+    def complete(root: FsPath) -> bool:
+        ops = root / pkg / "_ops.py"
+        if not ops.exists():
+            return False
+        m = re.search(lib_re, ops.read_text())
+        return bool(m) and any((root / pkg).glob(f"{m.group(1)}*.so"))
+
+    if complete(FA3_BAKED_DIR):
+        root, where = FA3_BAKED_DIR, "image"
+    else:
+        root, where = WEIGHTS_ROOT / "flash-attn3", "downloaded"
+        pull = dict(repo_id=FA3_KERNEL_REPO, revision=FA3_KERNEL_REVISION, local_dir=str(root))
+        snapshot_download(allow_patterns=[f"{pkg}/*.py"], **pull)
+        ops = root / pkg / "_ops.py"
+        if not ops.exists():
+            raise RuntimeError(f"no FA3 kernel build for {variant}")
+        # The folder holds several builds of the extension; fetch only the one _ops.py loads.
+        lib = re.search(lib_re, ops.read_text()).group(1)
+        snapshot_download(allow_patterns=[f"{pkg}/{lib}*.so"], **pull)
     sys.path.insert(0, str(root / "build" / variant))
-    return importlib.import_module("flash_attn3"), f"{FA3_KERNEL_REPO}@{FA3_KERNEL_REVISION[:7]} {variant}"
+    return importlib.import_module("flash_attn3"), f"{FA3_KERNEL_REPO}@{FA3_KERNEL_REVISION[:7]} {variant} ({where})"
 
 
 def _install_attention_backend() -> str:
@@ -461,6 +522,8 @@ class Runner(BaseRunner):
         from longcat_video.pipeline_longcat_video_avatar import LongCatVideoAvatarPipeline
 
         torch.backends.cuda.matmul.allow_tf32 = True
+        # Let cuDNN time its algorithms for the VAE's 3D convolutions once per frame size.
+        torch.backends.cudnn.benchmark = True
         torch.backends.cudnn.allow_tf32 = True
 
         # Single-process "torchrun": the pipeline reads its context-parallel state from
@@ -566,6 +629,12 @@ class Runner(BaseRunner):
             return pipe_get_shape(self.pipe, condition, resolution, scale_factor_spatial=scale_factor_spatial)
 
         self.pipe.get_condition_shape = get_condition_shape
+
+        self.timer = _PhaseTimer(torch.cuda.synchronize)
+        self.timer.wrap(self.pipe.dit, "forward", "dit")
+        self.timer.wrap(self.pipe.vae, "encode", "vae encode")
+        self.timer.wrap(self.pipe, "_decode_video_latents", "vae decode")
+        self.timer.wrap(self.pipe, "encode_prompt", "text")
         print(
             f"[setup] ready in {time.time() - t_setup:.0f}s, "
             f"{torch.cuda.memory_allocated() / 1e9:.1f} GB on GPU"
@@ -642,19 +711,21 @@ class Runner(BaseRunner):
         if sparse_attention > 0 and not sparse_on:
             print("[predict] sparse attention is unavailable on this machine; running dense")
 
+        self.timer.reset()
         work = self.tmp_root / f"run-{int(t_start * 1000)}"
         work.mkdir(parents=True, exist_ok=True)
         try:
             # 1. Audio: normalise to 44.1 kHz stereo wav, cut to the allowed length.
             cap = min(float(max_duration), MAX_DURATION[resolution])
             speech_wav = work / "speech.wav"
-            subprocess.run(
-                [
-                    "ffmpeg", "-loglevel", "error", "-y", "-i", str(audio), "-vn",
-                    "-ac", "2", "-ar", "44100", "-t", f"{cap:.3f}", str(speech_wav),
-                ],
-                check=True,
-            )
+            with self.timer.phase("audio convert"):
+                subprocess.run(
+                    [
+                        "ffmpeg", "-loglevel", "error", "-y", "-i", str(audio), "-vn",
+                        "-ac", "2", "-ar", "44100", "-t", f"{cap:.3f}", str(speech_wav),
+                    ],
+                    check=True,
+                )
             import soundfile as sf
 
             duration = sf.info(str(speech_wav)).duration
@@ -669,7 +740,8 @@ class Runner(BaseRunner):
 
             audio_seconds = generate_seconds + 1.0
             if isolate_voice:
-                speech, sr = separate_vocals(self.separator, str(speech_wav), duration=audio_seconds)
+                with self.timer.phase("voice isolation"):
+                    speech, sr = separate_vocals(self.separator, str(speech_wav), duration=audio_seconds)
                 if speech.size == 0 or float(np.abs(speech).max()) < 1e-4:
                     raise ValueError("No voice found in the audio. Try isolate_voice=false.")
             else:
@@ -680,14 +752,15 @@ class Runner(BaseRunner):
             if pad > 0:
                 speech = np.append(speech, np.zeros(pad, dtype=np.float32))
 
-            full_audio_emb = self.pipe.get_audio_embedding(
-                speech,
-                fps=FPS * AUDIO_STRIDE,
-                device=self.device,
-                sample_rate=sr,
-                model_type=MODEL_TYPE,
-                use_loudness_norm=False,
-            )
+            with self.timer.phase("audio embedding"):
+                full_audio_emb = self.pipe.get_audio_embedding(
+                    speech,
+                    fps=FPS * AUDIO_STRIDE,
+                    device=self.device,
+                    sample_rate=sr,
+                    model_type=MODEL_TYPE,
+                    use_loudness_norm=False,
+                )
             if torch.isnan(full_audio_emb).any():
                 raise ValueError("The audio could not be encoded (NaN embedding).")
 
@@ -715,6 +788,10 @@ class Runner(BaseRunner):
                 use_distill=True,
             )
 
+            prep = self.timer.snapshot()
+            print(f"[predict] prep: {', '.join(f'{k} {v:.1f}s' for k, v in prep.items())} "
+                  f"({time.time() - t_start:.1f}s since start)")
+
             # 3. First segment.
             audio_start = 0
             t_seg = time.time()
@@ -739,14 +816,17 @@ class Runner(BaseRunner):
             del output
             _torch_gc()
             last_segment_seconds = time.time() - t_seg
-            print(f"[predict] segment 1/{num_segments} in {last_segment_seconds:.1f}s")
+            print(f"[predict] segment 1/{num_segments} in {last_segment_seconds:.1f}s "
+                  f"({self.timer.breakdown(prep, self.timer.snapshot(), last_segment_seconds)})")
 
             frame_h, frame_w = video_array.shape[1:3]
             total_frames = len(video_array) + (num_segments - 1) * (NUM_FRAMES - NUM_COND_FRAMES)
             frames = np.empty((total_frames, frame_h, frame_w, 3), dtype=np.uint8)
             frames[: len(video_array)] = video_array
             n_frames = len(video_array)
-            current_video = [PIL.Image.fromarray(f) for f in video_array]
+            # The continuation only reads the last NUM_COND_FRAMES frames (each preprocessed on
+            # its own), so hand over just those instead of all 93.
+            current_video = [PIL.Image.fromarray(f) for f in video_array[-NUM_COND_FRAMES:]]
             ref_latent = latent[:, :, :1].clone()
 
             # 4. Audio-driven continuation for the rest of the speech.
@@ -759,6 +839,7 @@ class Runner(BaseRunner):
                     )
                     break
                 t_seg = time.time()
+                phases_before = self.timer.snapshot()
                 builds_before = self.kv_cache.builds
                 audio_start += AUDIO_STRIDE * (NUM_FRAMES - NUM_COND_FRAMES)
                 output, latent = self.pipe.generate_avc(
@@ -783,11 +864,12 @@ class Runner(BaseRunner):
                 appended = new_frames[NUM_COND_FRAMES:]
                 frames[n_frames : n_frames + len(appended)] = appended
                 n_frames += len(appended)
-                current_video = [PIL.Image.fromarray(f) for f in new_frames]
+                current_video = [PIL.Image.fromarray(f) for f in new_frames[-NUM_COND_FRAMES:]]
                 last_segment_seconds = time.time() - t_seg
                 print(
                     f"[predict] segment {segment_idx + 1}/{num_segments} in {last_segment_seconds:.1f}s "
-                    f"(carried frames computed {cache_builds}x)"
+                    f"(carried frames computed {cache_builds}x; "
+                    f"{self.timer.breakdown(phases_before, self.timer.snapshot(), last_segment_seconds)})"
                 )
 
             # 5. Encode with the (trimmed) original audio. Segments overshoot the speech by up
@@ -797,9 +879,11 @@ class Runner(BaseRunner):
             shutil.rmtree(out_dir, ignore_errors=True)
             out_dir.mkdir(parents=True)
             out_base = out_dir / "longcat-avatar"
-            save_video_ffmpeg(
-                torch.from_numpy(frames[:n_out]), str(out_base), str(speech_wav), fps=FPS, quality=10
-            )
+            with self.timer.phase("write video"):
+                save_video_ffmpeg(
+                    torch.from_numpy(frames[:n_out]), str(out_base), str(speech_wav), fps=FPS, quality=10
+                )
+            print(f"[predict] write video {self.timer.totals['write video']:.1f}s")
             if sparse_on:
                 print(f"[predict] sparse attention: {self.sparse.calls['sparse']} sparse / "
                       f"{self.sparse.calls['dense']} dense calls, {frame_w}x{frame_h}")

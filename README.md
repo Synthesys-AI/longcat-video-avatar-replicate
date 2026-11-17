@@ -15,7 +15,7 @@ This follows the model card's 1.6 recipe on one GPU:
 - Whisper-large-v3 audio features and Kim_Vocal_2 voice isolation.
 - 25 fps output, muxed with your original audio.
 - The 13 frames each segment carries over are computed once per LoRA setting (twice per segment), not on every step. That is LongCat's own KV cache, which Meituan's demo only uses with the LoRA mix off, because the mix changes the LoRA weights partway through. Here the cache is rebuilt when they change. Those frames never see the new frames, so the video is the same.
-- FlashAttention 3 on the H100, from a pinned prebuilt torch 2.6 build on Hugging Face's kernel hub (`kernels-community/flash-attn3`), fetched at startup. PyTorch's own FA3 wheel needs torch 2.9, and Replicate has no prebuilt base image for that, so the image would carry all of torch and take hours to upload. FA3 is self-tested against PyTorch SDPA at startup. If it fails, FlashAttention 2 takes over, then SDPA. Set `LONGCAT_ATTENTION=fa3|fa2|sdpa` to force one.
+- FlashAttention 3 on the H100, from a pinned prebuilt torch 2.6 build on Hugging Face's kernel hub (`kernels-community/flash-attn3`). The build copies it into the image, so boots don't depend on that repo, which Hugging Face says is being retired. Startup downloads it only if that copy is missing. PyTorch's own FA3 wheel needs torch 2.9, and Replicate has no prebuilt base image for that, so the image would carry all of torch and take hours to upload. FA3 is self-tested against PyTorch SDPA at startup. If it fails, FlashAttention 2 takes over, then SDPA. Set `LONGCAT_ATTENTION=fa3|fa2|sdpa` to force one.
 
 Meituan's inference code is cloned at a pinned commit, `58eb336`, when the image is built.
 The weights, about 63 GB from pinned Hugging Face revisions, download in `setup()` when a
@@ -34,6 +34,8 @@ machine first boots. That keeps the image small enough to build on a GitHub runn
 
 On one H100 with FlashAttention 3, 480p takes about 49 s for the first 3.7 s of video and 45 s per 3.2 s after that (50 s before carried-frame reuse, 58.6 s with FlashAttention 2). An 8 s clip takes about 3.2 min; 82 s should take about 21 min. A cold start adds about 4 min while the weights download. Replicate stops any prediction after 30 minutes. The predictor stops starting new segments
 before it hits that limit and returns the video made so far, and the logs say so.
+
+The logs time each phase: audio prep, then per segment the DiT steps, VAE encode/decode, text encoding and everything else.
 
 ## Publishing
 
