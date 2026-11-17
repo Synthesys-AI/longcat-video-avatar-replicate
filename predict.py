@@ -635,10 +635,49 @@ class Runner(BaseRunner):
         self.timer.wrap(self.pipe.vae, "encode", "vae encode")
         self.timer.wrap(self.pipe, "_decode_video_latents", "vae decode")
         self.timer.wrap(self.pipe, "encode_prompt", "text")
+        self._warm_up_audio()
         print(
             f"[setup] ready in {time.time() - t_setup:.0f}s, "
             f"{torch.cuda.memory_allocated() / 1e9:.1f} GB on GPU"
         )
+
+    def _warm_up_audio(self) -> None:
+        """Run the audio prep once at boot. A machine's first prediction spent ~50 s more
+        outside the video segments than later ones (192 s vs 126 s for the same 8 s clip,
+        with only ~15 s explained by the segments), so that one-off cost lands here, in
+        setup, instead of in a user's paid prediction. 15 s of audio gives the separator
+        both full and partial batches."""
+        import soundfile as sf
+        from longcat_video.audio_process.vocal_separator import separate_vocals
+
+        t0 = time.time()
+        try:
+            warm = self.tmp_root / "warmup"
+            warm.mkdir(parents=True, exist_ok=True)
+            sr, secs = 44100, 15.0
+            t = np.arange(int(sr * secs), dtype=np.float32) / sr
+            tone = 0.3 * np.sin(2 * np.pi * 220.0 * t) * (1 + 0.5 * np.sin(2 * np.pi * 3.0 * t))
+            noisy = tone + 0.01 * np.random.default_rng(0).standard_normal(t.shape).astype(np.float32)
+            src, wav = warm / "in.wav", warm / "speech.wav"
+            sf.write(str(src), np.stack([noisy, noisy], axis=1), sr)
+            subprocess.run(
+                ["ffmpeg", "-loglevel", "error", "-y", "-i", str(src), "-vn", "-ac", "2", "-ar", "44100", str(wav)],
+                check=True,
+            )
+            speech, rate = separate_vocals(self.separator, str(wav), duration=secs)
+            pad = int(secs * rate) - len(speech)
+            if pad > 0:
+                speech = np.append(speech, np.zeros(pad, dtype=np.float32))
+            self.pipe.get_audio_embedding(
+                speech, fps=FPS * AUDIO_STRIDE, device=self.device, sample_rate=rate,
+                model_type=MODEL_TYPE, use_loudness_norm=False,
+            )
+            print(f"[setup] audio warm-up done in {time.time() - t0:.1f}s")
+        except Exception as exc:  # noqa: BLE001 - warm-up is only an optimisation
+            print(f"[setup] audio warm-up skipped after {time.time() - t0:.1f}s ({exc!r})")
+        finally:
+            shutil.rmtree(self.tmp_root / "warmup", ignore_errors=True)
+            _torch_gc()
 
     def run(
         self,

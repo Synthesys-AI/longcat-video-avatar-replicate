@@ -22,6 +22,10 @@ on:
         description: "sparse_attention input (empty = the model's default)"
         required: false
         default: ""
+      version:
+        description: "Run this exact version id (empty = the model's latest)"
+        required: false
+        default: ""
 
 jobs:
   smoke:
@@ -38,6 +42,7 @@ jobs:
           PREDICTION_ID: ${{ inputs.prediction_id }}
           SMOKE_SECONDS: ${{ inputs.seconds }}
           SMOKE_SPARSITY: ${{ inputs.sparse_attention }}
+          VERSION: ${{ inputs.version }}
           WAIT_MINUTES: "70"
         run: |
           set -euo pipefail
