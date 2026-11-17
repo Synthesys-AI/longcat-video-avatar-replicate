@@ -62,7 +62,10 @@ done
 jq -r '.logs // ""' <<<"$p" | grep -E '^\[predict\]' || true
 if [ "$status" != succeeded ]; then jq '{status, error}' <<<"$p"; exit 1; fi
 url=$(jq -r 'if (.output|type) == "array" then .output[0] else .output end' <<<"$p")
-out="$(dirname "$audio")/$(basename "${audio%.*}")-longcat.mp4"
+base="$(dirname "$audio")/$(basename "${audio%.*}")-longcat"
+out="$base.mp4"
+n=2
+while [ -e "$out" ]; do out="$base-$n.mp4"; n=$((n + 1)); done  # never overwrite an earlier run
 curl -sSL -o "$out" "$url"
 secs=$(jq -r '.metrics.predict_time' <<<"$p")
 python3 -c "import sys; t=float(sys.argv[1]); print(f'GPU time {t:.0f} s, about \${t*0.001525:.2f} on an H100')" "$secs"

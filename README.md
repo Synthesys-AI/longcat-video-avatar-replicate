@@ -41,7 +41,7 @@ The last segment only generates the frames the audio still needs (rounded up to 
 
 ## Trying your own files
 
-`scripts/run_local.sh <image> <audio> [prompt] [extra input JSON]` uploads both files to your Replicate account (Files API, private), runs the latest version on the whole recording and saves `<audio>-longcat.mp4` next to the audio. It reads `REPLICATE_API_TOKEN`, or asks for it without echoing it. `DRY_RUN=1` shows the request instead.
+`scripts/run_local.sh <image> <audio> [prompt] [extra input JSON]` uploads both files to your Replicate account (Files API, private), runs the latest version on the whole recording and saves `<audio>-longcat.mp4` next to the audio (then `-2`, `-3`, … so earlier runs are never overwritten). It reads `REPLICATE_API_TOKEN`, or asks for it without echoing it. `DRY_RUN=1` shows the request instead.
 
 ## Publishing
 
