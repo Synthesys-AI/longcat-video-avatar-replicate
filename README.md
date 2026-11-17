@@ -23,13 +23,13 @@ machine first boots. That keeps the image small enough to build on a GitHub runn
 | --- | --- |
 | `audio` | The speech (mp3, wav or m4a, or a video file). The output is as long as the audio. |
 | `image` | Optional. Without it, the person is made from `prompt`, at `aspect_ratio`. |
-| `resolution` | `480p` (up to 120 s) or `720p` (up to 45 s). |
+| `resolution` | `480p` (up to 75 s) or `720p` (up to 15 s). |
 | `max_duration` | Longer audio is cut at this point. |
 | `isolate_voice` | Strips music or noise before lip-sync. The output keeps the original audio. |
 | `mix_steps`, `mix_alpha` | The LoRA mix. Leave these at the defaults unless faces distort. |
 | `seed` | Use it to reproduce a run. |
 
-Replicate stops any prediction after 30 minutes. The predictor stops starting new segments
+On one H100, 480p takes about 58.6 s per 3.2 s of new video, so 8 s of video takes about 3.7 min. A cold start adds about 4 min while the weights download. Replicate stops any prediction after 30 minutes. The predictor stops starting new segments
 before it hits that limit and returns the video made so far, and the logs say so.
 
 ## Publishing

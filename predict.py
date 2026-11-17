@@ -89,7 +89,9 @@ NEXT_SEGMENT_SECONDS = (NUM_FRAMES - NUM_COND_FRAMES) / FPS  # 3.2 s
 # Replicate stops a prediction at 30 min. Stop starting new segments in time to
 # finish the one in flight and encode, and return the video made so far.
 TIME_BUDGET_SECONDS = 26 * 60
-MAX_DURATION = {"480p": 120.0, "720p": 45.0}
+# Measured on one H100: 58.6 s per 480p segment (3.2 s of new video). 75 s of video is
+# 24 segments, about 23.5 min. 720p is NOT measured yet (estimated ~4x slower per segment).
+MAX_DURATION = {"480p": 75.0, "720p": 15.0}
 
 NEGATIVE_PROMPT = (
     "Close-up, Bright tones, overexposed, static, blurred details, subtitles, style, works, "
@@ -273,7 +275,7 @@ class Runner(BaseRunner):
             default=DEFAULT_PROMPT,
         ),
         resolution: str = Input(
-            description="Output resolution. 720p is slower and capped at a shorter length.",
+            description="Output resolution. 720p is much slower, so it is capped at 15 s.",
             choices=["480p", "720p"],
             default="480p",
         ),
@@ -283,10 +285,10 @@ class Runner(BaseRunner):
             default="16:9",
         ),
         max_duration: float = Input(
-            description="Longest video to make, in seconds. Longer audio is cut. Hard limits: 120 s at 480p, 45 s at 720p.",
-            default=60.0,
+            description="Longest video to make, in seconds. Longer audio is cut. Limits: 75 s at 480p, 15 s at 720p (Replicate stops runs at 30 min).",
+            default=30.0,
             ge=1.0,
-            le=120.0,
+            le=75.0,
         ),
         isolate_voice: bool = Input(
             description="Strip music and background noise from the audio before driving the lips (the output keeps your original audio).",
@@ -459,13 +461,15 @@ class Runner(BaseRunner):
                     f"[predict] segment {segment_idx + 1}/{num_segments} in {last_segment_seconds:.1f}s"
                 )
 
-            # 5. Encode with the (trimmed) original audio; ffmpeg -shortest trims the tail.
+            # 5. Encode with the (trimmed) original audio. Segments overshoot the speech by up
+            # to ~3 s and ffmpeg -shortest does not reliably cut the video, so trim frames here.
+            n_out = min(n_frames, max(1, round(duration * FPS)))
             out_dir = FsPath("/tmp/outputs")
             shutil.rmtree(out_dir, ignore_errors=True)
             out_dir.mkdir(parents=True)
             out_base = out_dir / "longcat-avatar"
             save_video_ffmpeg(
-                torch.from_numpy(frames[:n_frames]), str(out_base), str(speech_wav), fps=FPS, quality=10
+                torch.from_numpy(frames[:n_out]), str(out_base), str(speech_wav), fps=FPS, quality=10
             )
             print(f"[predict] done in {time.time() - t_start:.0f}s")
             return Path(f"{out_base}.mp4")
