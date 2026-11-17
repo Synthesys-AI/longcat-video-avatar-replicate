@@ -4,7 +4,7 @@
 # Written for Cog v0.23 (BaseRunner / run()).
 build:
   gpu: true
-  cuda: "12.4"
+  cuda: "12.8"
   python_version: "3.10"
   system_packages:
     - ffmpeg
@@ -12,8 +12,9 @@ build:
     - git
   python_requirements: requirements.txt
   run:
-    # Prebuilt FlashAttention-2 for torch 2.6 / CUDA 12 / py3.10 (PyPI torch 2.6 uses the old C++ ABI).
-    - pip install --no-deps "https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.4.post1/flash_attn-2.7.4.post1+cu12torch2.6cxx11abiFALSE-cp310-cp310-linux_x86_64.whl"
+    # FlashAttention 3 (Hopper/H100): PyTorch's official build (needs torch>=2.9, CUDA 12.8),
+    # hash-pinned. predict.py self-tests it at startup and falls back to PyTorch SDPA.
+    - pip install --no-deps "https://download.pytorch.org/whl/cu128/flash_attn_3-3.0.1-cp310-abi3-manylinux_2_28_x86_64.whl#sha256=ad5a4df356a786e817dd2ba2e63bb6406dc13d1695fae0b6ba090b8968832ad9"
     # Meituan's inference code, pinned to the commit this predictor was written against.
     - git clone https://github.com/meituan-longcat/LongCat-Video /opt/LongCat-Video && cd /opt/LongCat-Video && git checkout 58eb336edc5c8c63389838727e40b8c18434e54e && rm -rf .git
 run: "predict.py:Runner"

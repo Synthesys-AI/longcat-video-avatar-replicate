@@ -154,6 +154,99 @@ def _download_weights() -> None:
         print(f"[setup] downloaded {repo}@{revision[:8]} in {time.time() - t0:.0f}s")
 
 
+def _sdpa(q, k, v, softmax_scale=None, causal=False):
+    """PyTorch SDPA on FlashAttention's [B, S, H, D] layout."""
+    out = torch.nn.functional.scaled_dot_product_attention(
+        q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), scale=softmax_scale, is_causal=causal
+    )
+    return out.transpose(1, 2)
+
+
+def _sdpa_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q=None, max_seqlen_k=None,
+                 softmax_scale=None, causal=False, **_):
+    """Variable-length attention on packed [total, H, D] tensors, one SDPA call per sequence."""
+    cq, ck = cu_seqlens_q.tolist(), cu_seqlens_k.tolist()
+    outs = [
+        _sdpa(q[None, cq[i]:cq[i + 1]], k[None, ck[i]:ck[i + 1]], v[None, ck[i]:ck[i + 1]],
+              softmax_scale=softmax_scale, causal=causal)[0]
+        for i in range(len(cq) - 1)
+    ]
+    return torch.cat(outs, dim=0)
+
+
+def _install_attention_backend() -> str:
+    """Make `flash_attn_interface` behave the way LongCat's FA3 code path expects.
+
+    LongCat calls `x, *_ = flash_attn_func(...)` and `flash_attn_varlen_func(...)[0]`, i.e. it
+    expects (out, lse) tuples, but FA3 3.x returns just `out` unless return_attn_probs=True.
+    Unwrapped, `[0]` would silently take the first row. So we wrap both to return a tuple.
+    FA3 is self-tested against SDPA first; if it is missing or wrong (e.g. not a Hopper GPU)
+    a pure-PyTorch SDPA module stands in. LONGCAT_ATTENTION=fa3|sdpa forces one.
+    """
+    import types
+
+    want = os.environ.get("LONGCAT_ATTENTION", "auto").lower()
+    if want in ("auto", "fa3"):
+        try:
+            import flash_attn_interface as fa3
+
+            g = torch.Generator(device="cuda").manual_seed(0)
+            q, k, v = (
+                torch.randn(1, 512, 8, 128, device="cuda", dtype=torch.bfloat16, generator=g)
+                for _ in range(3)
+            )
+            scale = 128 ** -0.5
+            res = fa3.flash_attn_func(q, k, v, softmax_scale=scale)
+            out = res[0] if isinstance(res, (tuple, list)) else res
+            err = (out.float() - _sdpa(q, k, v, softmax_scale=scale).float()).abs().max().item()
+            if out.shape != q.shape or not err < 2e-2:
+                raise RuntimeError(f"self-test mismatch: shape {tuple(out.shape)}, max err {err:.4f}")
+
+            # Varlen, packed like LongCat's text cross-attention: 2 queries of 256, keys 100 + 200.
+            qp = q[0, :512].contiguous()
+            kp, vp = k[0, :300].contiguous(), v[0, :300].contiguous()
+            cu_q = torch.tensor([0, 256, 512], device="cuda", dtype=torch.int32)
+            cu_k = torch.tensor([0, 100, 300], device="cuda", dtype=torch.int32)
+            res = fa3.flash_attn_varlen_func(
+                q=qp, k=kp, v=vp, cu_seqlens_q=cu_q, cu_seqlens_k=cu_k,
+                max_seqlen_q=256, max_seqlen_k=200, softmax_scale=scale,
+            )
+            out_v = res[0] if isinstance(res, (tuple, list)) else res
+            ref_v = _sdpa_varlen(qp, kp, vp, cu_q, cu_k, softmax_scale=scale)
+            err_v = (out_v.float() - ref_v.float()).abs().max().item()
+            if out_v.shape != qp.shape or not err_v < 2e-2:
+                raise RuntimeError(f"varlen self-test mismatch: shape {tuple(out_v.shape)}, max err {err_v:.4f}")
+            err = max(err, err_v)
+
+            raw_func, raw_varlen = fa3.flash_attn_func, fa3.flash_attn_varlen_func
+
+            def flash_attn_func(*args, **kwargs):
+                res = raw_func(*args, **kwargs)
+                return res if isinstance(res, tuple) else (res, None)
+
+            def flash_attn_varlen_func(*args, **kwargs):
+                res = raw_varlen(*args, **kwargs)
+                return res if isinstance(res, tuple) else (res, None)
+
+            fa3.flash_attn_func = flash_attn_func
+            fa3.flash_attn_varlen_func = flash_attn_varlen_func
+            print(f"[setup] attention: FlashAttention 3 (self-test max err {err:.4f})")
+            return "fa3"
+        except Exception as exc:  # noqa: BLE001 - any failure means "use the fallback"
+            if want == "fa3":
+                raise
+            print(f"[setup] attention: FlashAttention 3 unavailable ({exc!r}); using PyTorch SDPA")
+
+    shim = types.ModuleType("flash_attn_interface")
+    shim.flash_attn_func = lambda q, k, v, softmax_scale=None, causal=False, **_: (
+        _sdpa(q, k, v, softmax_scale=softmax_scale, causal=causal), None)
+    shim.flash_attn_varlen_func = lambda *a, **kw: (_sdpa_varlen(*a, **kw), None)
+    sys.modules["flash_attn_interface"] = shim
+    if want == "sdpa":
+        print("[setup] attention: PyTorch SDPA (forced)")
+    return "sdpa"
+
+
 class Runner(BaseRunner):
     def setup(self) -> None:
         t_setup = time.time()
@@ -191,6 +284,9 @@ class Runner(BaseRunner):
         )
         cp_split_hw = context_parallel_util.get_optimal_split(1)
         self.device = 0
+        # Both backends are reached through LongCat's FA3 code path (the SDPA fallback
+        # registers itself as `flash_attn_interface`), so FA2 is not needed at all.
+        self.attention = _install_attention_backend()
 
         tokenizer = AutoTokenizer.from_pretrained(str(BASE_DIR), subfolder="tokenizer")
         text_encoder = UMT5EncoderModel.from_pretrained(
@@ -207,6 +303,8 @@ class Runner(BaseRunner):
             str(AVATAR_DIR),
             subfolder="base_model",
             cp_split_hw=cp_split_hw,
+            enable_flashattn3=True,
+            enable_flashattn2=False,
             torch_dtype=torch.bfloat16,
         ).to(self.device)
         dit.load_lora(
@@ -316,7 +414,7 @@ class Runner(BaseRunner):
         t_start = time.time()
         if seed is None:
             seed = secrets.randbelow(2**31)
-        print(f"[predict] seed={seed}")
+        print(f"[predict] seed={seed} attention={self.attention}")
 
         work = self.tmp_root / f"run-{int(t_start * 1000)}"
         work.mkdir(parents=True, exist_ok=True)
