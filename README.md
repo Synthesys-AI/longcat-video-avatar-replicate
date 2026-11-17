@@ -30,7 +30,7 @@ machine first boots. That keeps the image small enough to build on a GitHub runn
 | `mix_steps`, `mix_alpha` | The LoRA mix. Leave these at the defaults unless faces distort. |
 | `seed` | Use it to reproduce a run. |
 
-With FlashAttention 2 on one H100, 480p took about 58.6 s per 3.2 s of new video, so 8 s of video takes about 3.7 min. A cold start adds about 4 min while the weights download. Replicate stops any prediction after 30 minutes. The predictor stops starting new segments
+On one H100 with FlashAttention 3, 480p takes about 50 s per 3.2 s of new video (58.6 s with FlashAttention 2), so 8 s of video takes about 3.3 min. A cold start adds about 4 min while the weights download. Replicate stops any prediction after 30 minutes. The predictor stops starting new segments
 before it hits that limit and returns the video made so far, and the logs say so.
 
 ## Publishing
