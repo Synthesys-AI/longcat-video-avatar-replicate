@@ -354,7 +354,8 @@ def _merged_weight(weight, active):
 
 def _make_merging_factory(branch_factory, counter: list):
     """Wrap LongCat's `dit._create_multi_lora_forward(module, loras)` (called by
-    `enable_loras`, so on every request's `enable_lora_mix`): the forward it returns merges
+    `enable_loras`: at setup, and on any request `_set_lora_mix` sends through LongCat's
+    `enable_lora_mix`): the forward it returns merges
     while `_MERGE_ON[0]` is set and the call is big enough, else runs LongCat's branch."""
 
     def create(module, loras):
@@ -1052,6 +1053,79 @@ def _profile_report(prof, wall: float, top: int = 18) -> list:
     return lines
 
 
+def _set_lora_mix(dit, mix_alpha: float, mix_steps: int) -> bool:
+    """Set the per-request DMD/OPSD LoRA mix, leaving the same state as LongCat's
+    `enable_lora_mix`. That call goes through `enable_loras`, whose `disable_all_loras` moves
+    both LoRA networks to the CPU (`lora.to("cpu")`) before moving them back to the GPU:
+    ~2.5 GB each way on every request, inside billed time. When setup already enabled this
+    mix (same networks, layers still wrapped, weights still on the GPU), only the multipliers
+    change per request. Returns True when that fast path was used."""
+    if not 0.0 <= mix_alpha <= 1.0:
+        raise ValueError(f"mix_alpha must be in [0, 1], got {mix_alpha}")
+    cfg = getattr(dit, "lora_mix_config", None)
+    networks = [dit.lora_dict.get(key) for key in ("dmd", "opsd")]
+    loras = [lora for net in networks if net is not None for lora in net.loras]
+    device = next(dit.parameters()).device
+    ready = (
+        cfg is not None and cfg.get("dmd_key") == "dmd" and cfg.get("opsd_key") == "opsd"
+        and list(getattr(dit, "active_loras", [])) == ["dmd", "opsd"]
+        and all(net is not None for net in networks) and bool(loras)
+        and all(lora.lora_down.weight.device == device for lora in loras)
+        and any(hasattr(m, "org_forward") for m in dit.modules())
+    )
+    if not ready:
+        dit.enable_lora_mix("dmd", "opsd", mix_alpha, mix_steps)
+        return False
+    dit.lora_mix_config = {"dmd_key": "dmd", "opsd_key": "opsd", "mix_alpha": mix_alpha, "mix_steps": mix_steps}
+    dit._lora_mix_active = None
+    dit.set_lora_mix_step(0)  # the instance attribute: keeps _MixAwareKVCache's hook
+    return True
+
+
+def _gpu_postprocess_video(orig):
+    """Wrap diffusers' VideoProcessor.postprocess_video (np output): run its own denormalize
+    on the GPU ("pt" output), then the `* 255` and truncating uint8 cast predict.py applied
+    on the CPU, and copy only uint8 frames back. diffusers' np path copies bf16 frames to the
+    host, converts them to fp32 there and stacks them; predict.py then scaled and cast on one
+    core. Same ops in the same precision, so the frames are bit-identical."""
+    def postprocess_video(video, output_type="np"):
+        if output_type != "np" or not torch.is_tensor(video):
+            return orig(video, output_type=output_type)
+        frames = orig(video, output_type="pt")  # [B, F, C, H, W], denormalized, same dtype
+        return frames.permute(0, 1, 3, 4, 2).float().mul(255).to(torch.uint8).cpu().numpy()
+
+    return postprocess_video
+
+
+def _frames_uint8(frames) -> np.ndarray:
+    """Decoded frames [F, H, W, 3] as uint8: already uint8 from `_gpu_postprocess_video`, or
+    diffusers' float frames in [0, 1] (scaled and truncated exactly as before)."""
+    return frames if frames.dtype == np.uint8 else (frames * 255).astype(np.uint8)
+
+
+def _speed_up_vae(vae) -> str:
+    """Exact VAE savings. LongCat's own cache-view switches (its demo turns them on): keep
+    views of the 2-frame causal caches instead of cloning them, which is safe because nothing
+    in the VAE writes in place. Nearest-exact upsampling straight in bf16: a pure copy, so the
+    fp32 round trip around it changes nothing. And no `+ 0.0` pass in RMS norms without a
+    bias. (Meituan's fused-padding switch is left off: it may change cuDNN's rounding.)"""
+    vae.enable_decoder_cache_views()
+    vae.enable_encoder_cache_views()
+    up = rms = 0
+    for m in vae.modules():
+        cls = type(m).__name__
+        if cls == "WanUpsample" and getattr(m, "mode", None) == "nearest-exact":
+            m.forward = types.MethodType(torch.nn.Upsample.forward, m)
+            up += 1
+        elif cls == "WanRMS_norm" and isinstance(m.bias, float) and m.bias == 0.0:
+            def rms_forward(x, m=m):
+                return torch.nn.functional.normalize(x, dim=(1 if m.channel_first else -1)) * m.scale * m.gamma
+
+            m.forward = rms_forward
+            rms += 1
+    return f"cache views on, {up} upsamples in bf16, {rms} bias-free RMS norms"
+
+
 class _PhaseTimer:
     """Adds up GPU-synchronised wall time per named phase, so the logs show where a
     prediction's time goes (DiT steps vs. VAE vs. CPU work between them)."""
@@ -1563,6 +1637,9 @@ class Runner(BaseRunner):
             model_type=MODEL_TYPE,
         )
         self.pipe.to(self.device)
+        vp = self.pipe.video_processor
+        vp.postprocess_video = _gpu_postprocess_video(vp.postprocess_video)
+        print(f"[setup] VAE: {_speed_up_vae(self.pipe.vae)}; frames to uint8 on the GPU")
         self.kv_cache = _MixAwareKVCache(self.pipe)
 
         import longcat_video.modules.avatar.attention as avatar_attention
@@ -1884,8 +1961,9 @@ class Runner(BaseRunner):
                 centers = torch.clamp(centers, min=0, max=full_audio_emb.shape[0] - 1)
                 return full_audio_emb[centers][None, ...].to(self.device)
 
-            # 2. Per-request LoRA mix (the networks stay loaded; this only sets multipliers).
-            self.pipe.dit.enable_lora_mix("dmd", "opsd", float(mix_alpha), int(mix_steps))
+            # 2. Per-request LoRA mix: only the multipliers (see _set_lora_mix).
+            with self.timer.phase("lora mix"):
+                _set_lora_mix(self.pipe.dit, float(mix_alpha), int(mix_steps))
             generator = torch.Generator(device=self.device).manual_seed(seed)
             common = dict(
                 prompt=prompt,
@@ -1924,7 +2002,7 @@ class Runner(BaseRunner):
                     audio_emb=audio_window(audio_start, plan[0]),
                     **common,
                 )
-            video_array = (output[0] * 255).astype(np.uint8)
+            video_array = _frames_uint8(output[0])
             del output
             _torch_gc()
             last_segment_seconds = time.time() - t_seg
@@ -1980,7 +2058,7 @@ class Runner(BaseRunner):
                         print(line)
                 cache_builds = self.kv_cache.builds - builds_before
                 self.kv_cache.release()
-                new_frames = (output[0] * 255).astype(np.uint8)
+                new_frames = _frames_uint8(output[0])
                 del output
                 appended = new_frames[NUM_COND_FRAMES:]
                 frames[n_frames : n_frames + len(appended)] = appended
