@@ -15,6 +15,7 @@ Weights (~63 GB) are downloaded from pinned Hugging Face revisions in setup().
 """
 
 import collections
+import contextlib
 import functools
 import math
 import os
@@ -306,6 +307,114 @@ def _fp8_self_test(fp8_linear) -> str:
     if out.shape != ref.shape or not (rel < 0.06 and cos > 0.998):
         raise RuntimeError(f"self-test mismatch: rel err {rel:.4f}, cosine {cos:.5f}")
     return f"self-test rel err {rel:.4f}, cosine {cos:.5f}"
+
+
+# Developer profiling (`profile` input): one continuation segment under torch.profiler,
+# kernels grouped by name, plus labelled ranges for the code the remaining speed-up ideas
+# target (LoRA branches, the fp32 norm/modulation helpers, RoPE).
+_KERNEL_CATEGORIES = (  # first match wins; matched against the lower-cased kernel name
+    ("attention", ("flash", "fmha", "attn", "sage", "qk_int8")),
+    ("matmul", ("gemm", "xmma", "cutlass", "cublas", "nvjet", "matmul", "scaled_mm")),
+    ("conv (VAE)", ("conv", "implicit", "winograd", "cudnn")),
+    ("copy / concat", ("memcpy", "memset", "copy", "concat", "cat_")),
+    ("norm / reduce", ("norm", "reduce", "softmax", "welford")),
+    ("elementwise", ("elementwise", "vectorized", "unrolled", "triton")),
+)
+
+
+def _kernel_category(name: str) -> str:
+    low = name.lower()
+    for category, keys in _KERNEL_CATEGORIES:
+        if any(k in low for k in keys):
+            return category
+    return "other"
+
+
+@contextmanager
+def _profile_labels(dit):
+    """Wrap the code worth measuring in record_function ranges; undone on exit."""
+    from torch.profiler import record_function
+
+    patched = []
+
+    def label(obj, attr, name):
+        fn = getattr(obj, attr)
+        had = attr in vars(obj)
+
+        def labelled(*args, **kwargs):
+            with record_function("label: " + name):
+                return fn(*args, **kwargs)
+
+        setattr(obj, attr, labelled)
+        patched.append((obj, attr, fn, had))
+
+    try:
+        import longcat_video.modules.avatar.longcat_video_dit_avatar as dit_module
+
+        label(dit_module, "modulate_fp32", "modulate_fp32 (norm + shift/scale)")
+    except Exception:  # noqa: BLE001 - labels are best effort
+        pass
+    for _, module in dit.named_modules():
+        cls = type(module).__name__
+        if cls in ("RMSNorm_FP32", "LayerNorm_FP32"):
+            label(module, "forward", cls)
+        elif cls.startswith("RotaryPositionalEmbedding"):
+            label(module, "forward", "rope")
+        elif hasattr(module, "org_forward"):  # a layer under LongCat's LoRA wrapper
+            label(module, "forward", "LoRA-wrapped linears (base + LoRA)")
+            label(module, "org_forward", "LoRA-wrapped linears (base only)")
+    try:
+        yield
+    finally:
+        for obj, attr, fn, had in reversed(patched):
+            if had:
+                setattr(obj, attr, fn)
+            else:
+                delattr(obj, attr)
+
+
+@contextmanager
+def _profiled_segment(dit):
+    from torch.profiler import ProfilerActivity, profile
+
+    with _profile_labels(dit):
+        with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+            try:
+                yield prof
+            finally:
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+
+
+def _profile_report(prof, wall: float, top: int = 18) -> list:
+    """Lines for the log: GPU time by kernel category, labelled ranges, top kernels."""
+    from torch.autograd import DeviceType
+
+    def dev(e, field):
+        return float(getattr(e, field, None) or getattr(e, field.replace("device", "cuda"), 0.0) or 0.0)
+
+    kernels, labels = [], {}
+    for e in prof.key_averages():
+        if e.key.startswith("label: "):
+            name = e.key[len("label: "):]
+            labels[name] = max(labels.get(name, 0.0), dev(e, "device_time_total"), dev(e, "self_device_time_total"))
+        elif e.device_type == DeviceType.CUDA:
+            kernels.append((e.key, dev(e, "self_device_time_total"), e.count))
+    gpu = sum(t for _, t, _ in kernels) / 1e6
+    lines = [f"[profile] segment: {wall:.1f}s wall, {gpu:.1f}s of GPU kernels ({gpu / max(wall, 1e-9):.0%} busy)"]
+    by_category = collections.defaultdict(float)
+    for name, t, _ in kernels:
+        by_category[_kernel_category(name)] += t / 1e6
+    for category, t in sorted(by_category.items(), key=lambda kv: -kv[1]):
+        lines.append(f"[profile]   {category:14s} {t:6.2f}s  {t / max(gpu, 1e-9):5.1%}")
+    if labels:
+        lines.append("[profile] labelled code (GPU time inside the range):")
+        for name, t in sorted(labels.items(), key=lambda kv: -kv[1]):
+            lines.append(f"[profile]   {name:40s} {t / 1e6:6.2f}s")
+    lines.append(f"[profile] top {top} kernels (self GPU time, calls, category):")
+    for name, t, n in sorted(kernels, key=lambda r: -r[1])[:top]:
+        lines.append(f"[profile]   {t / 1e6:6.2f}s {n:6d}x {_kernel_category(name):14s} {name[:80]}")
+    return lines
 
 
 class _PhaseTimer:
@@ -974,6 +1083,13 @@ class Runner(BaseRunner):
             ),
             default=False,
         ),
+        profile: bool = Input(
+            description=(
+                "For developers: profile the second segment and print where its GPU time goes "
+                "(makes that segment a little slower)."
+            ),
+            default=False,
+        ),
         sage_attention: bool = Input(
             description=(
                 "Experimental speed-up: 8-bit attention (SageAttention2) for the video's attention. "
@@ -1148,22 +1264,29 @@ class Runner(BaseRunner):
                 builds_before = self.kv_cache.builds
                 audio_start += AUDIO_STRIDE * (plan[segment_idx - 1] - NUM_COND_FRAMES)
                 chunk_frames = plan[segment_idx]
-                output, latent = self.pipe.generate_avc(
-                    video=current_video,
-                    video_latent=latent,
-                    height=frame_h,
-                    width=frame_w,
-                    num_cond_frames=NUM_COND_FRAMES,
-                    use_kv_cache=True,  # carried frames computed once per LoRA state
-                    offload_kv_cache=False,
-                    enhance_hf=False,
-                    num_frames=chunk_frames,
-                    audio_emb=audio_window(audio_start, chunk_frames),
-                    ref_latent=ref_latent,
-                    ref_img_index=REF_IMG_INDEX,
-                    mask_frame_range=MASK_FRAME_RANGE,
-                    **common,
-                )
+                profiling = bool(profile) and segment_idx == 1
+                prof_ctx = _profiled_segment(self.pipe.dit) if profiling else contextlib.nullcontext()
+                t_prof = time.time()
+                with prof_ctx as prof:
+                    output, latent = self.pipe.generate_avc(
+                        video=current_video,
+                        video_latent=latent,
+                        height=frame_h,
+                        width=frame_w,
+                        num_cond_frames=NUM_COND_FRAMES,
+                        use_kv_cache=True,  # carried frames computed once per LoRA state
+                        offload_kv_cache=False,
+                        enhance_hf=False,
+                        num_frames=chunk_frames,
+                        audio_emb=audio_window(audio_start, chunk_frames),
+                        ref_latent=ref_latent,
+                        ref_img_index=REF_IMG_INDEX,
+                        mask_frame_range=MASK_FRAME_RANGE,
+                        **common,
+                    )
+                if profiling:
+                    for line in _profile_report(prof, time.time() - t_prof):
+                        print(line)
                 cache_builds = self.kv_cache.builds - builds_before
                 self.kv_cache.release()
                 new_frames = (output[0] * 255).astype(np.uint8)
