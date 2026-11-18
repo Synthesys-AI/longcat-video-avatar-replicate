@@ -416,6 +416,346 @@ def _merge_self_test(dit, rows: int = 2048) -> str:
             f"add-on share of the output >= {share:.3f}")
 
 
+# Fused small steps (`fused_ops` input, on by default). The profile put about a third of
+# each segment in small element-by-element steps that LongCat runs as separate fp32
+# kernels, each a full pass over the activations: the LayerNorm + shift/scale
+# ("modulate_fp32"), the affine LayerNorms before cross-attention, RMSNorm on q/k followed
+# by 3D RoPE, and the FFN's SiLU * gate. Each becomes one Triton kernel: read bf16 once,
+# do the same fp32 maths in registers (rounding to bf16 where LongCat does), write bf16
+# once. The self-attention q/k come out already in FlashAttention's [B, S, H, D] layout,
+# which also saves the copy LongCat makes before every attention call. Each kernel is
+# checked against LongCat's own code at boot; one that fails keeps LongCat's path.
+_FUSE_ON = [False]
+_FUSED = {}  # op name -> kernel wrapper; only ops whose boot self-test passed
+_FUSE_DEVICE = ["cuda"]  # tests route CPU tensors through stand-in kernels
+
+
+def _fusable(x, dims=None) -> bool:
+    return (x.device.type == _FUSE_DEVICE[0] and x.dtype == torch.bfloat16
+            and (dims is None or x.dim() == dims) and x.stride(-1) == 1)
+
+
+def _make_fused_kernels() -> dict:
+    import triton
+    import triton.language as tl
+
+    @triton.jit(do_not_specialize=["C", "S", "T", "a_sb", "a_st", "c_sb", "c_st"])
+    def _ln_kernel(x_ptr, out_ptr, a_ptr, c_ptr, C, S, T, a_sb, a_st, c_sb, c_st, eps,
+                   ADD_ONE: tl.constexpr, BLOCK: tl.constexpr):
+        # One row of C: LayerNorm in fp32, then * a + c, where a/c are per (batch, frame)
+        # (modulate: a = 1 + scale, c = shift) or per channel (affine: weight, bias).
+        row = tl.program_id(0).to(tl.int64)
+        offs = tl.arange(0, BLOCK)
+        mask = offs < C
+        x = tl.load(x_ptr + row * C + offs, mask=mask, other=0.0).to(tl.float32)
+        mean = tl.sum(x, axis=0) / C
+        d = tl.where(mask, x - mean, 0.0)
+        rstd = tl.rsqrt(tl.sum(d * d, axis=0) / C + eps)
+        bt = row // S
+        b = bt // T
+        t = bt % T
+        a = tl.load(a_ptr + b * a_sb + t * a_st + offs, mask=mask, other=0.0).to(tl.float32)
+        c = tl.load(c_ptr + b * c_sb + t * c_st + offs, mask=mask, other=0.0).to(tl.float32)
+        if ADD_ONE:
+            a = a + 1.0
+        y = d * rstd * a + c
+        tl.store(out_ptr + row * C + offs, y.to(out_ptr.dtype.element_ty), mask=mask)
+
+    @triton.jit(do_not_specialize=["R", "d1", "d2", "s0", "s1", "s2", "o0", "o1", "o2"])
+    def _rms_kernel(x_ptr, out_ptr, w_ptr, cos_ptr, sin_ptr, R, d1, d2, s0, s1, s2, o0, o1, o2,
+                    eps, D: tl.constexpr, BLOCK_R: tl.constexpr, ROPE: tl.constexpr):
+        # BLOCK_R rows of D (one head of one token each) from a strided [d0, d1, d2, D]
+        # tensor: RMSNorm as LongCat does it ((x * rsqrt(mean(x^2) + eps)) -> bf16, * weight
+        # -> bf16), then optionally RoPE with cos/sin row = the token index (dim 2), whose
+        # rotate_half maps each pair (2j, 2j+1) to (-x[2j+1], x[2j]).
+        r = tl.program_id(0).to(tl.int64) * BLOCK_R + tl.arange(0, BLOCK_R)
+        rmask = r < R
+        i2 = r % d2
+        i1 = (r // d2) % d1
+        i0 = r // (d2 * d1)
+        j = tl.arange(0, D // 2)
+        m = rmask[:, None]
+        src = (i0 * s0 + i1 * s1 + i2 * s2)[:, None] + 2 * j[None, :]
+        xe = tl.load(x_ptr + src, mask=m, other=0.0).to(tl.float32)
+        xo = tl.load(x_ptr + src + 1, mask=m, other=0.0).to(tl.float32)
+        rstd = tl.rsqrt((tl.sum(xe * xe, axis=1) + tl.sum(xo * xo, axis=1)) / D + eps)
+        ne = (xe * rstd[:, None]).to(tl.bfloat16).to(tl.float32)
+        no = (xo * rstd[:, None]).to(tl.bfloat16).to(tl.float32)
+        we = tl.load(w_ptr + 2 * j).to(tl.float32)
+        wo = tl.load(w_ptr + 2 * j + 1).to(tl.float32)
+        ne = (ne * we[None, :]).to(tl.bfloat16).to(tl.float32)
+        no = (no * wo[None, :]).to(tl.bfloat16).to(tl.float32)
+        if ROPE:
+            cs = (i2 * D)[:, None] + 2 * j[None, :]
+            ce = tl.load(cos_ptr + cs, mask=m, other=0.0)
+            co = tl.load(cos_ptr + cs + 1, mask=m, other=0.0)
+            se = tl.load(sin_ptr + cs, mask=m, other=0.0)
+            so = tl.load(sin_ptr + cs + 1, mask=m, other=0.0)
+            oe = ne * ce - no * se
+            oo = no * co + ne * so
+            ne = oe
+            no = oo
+        dst = (i0 * o0 + i1 * o1 + i2 * o2)[:, None] + 2 * j[None, :]
+        tl.store(out_ptr + dst, ne.to(out_ptr.dtype.element_ty), mask=m)
+        tl.store(out_ptr + dst + 1, no.to(out_ptr.dtype.element_ty), mask=m)
+
+    @triton.jit(do_not_specialize=["n"])
+    def _silu_mul_kernel(a_ptr, b_ptr, out_ptr, n, BLOCK: tl.constexpr):
+        # LongCat: F.silu(a) (bf16) * b (bf16)
+        offs = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < n
+        a = tl.load(a_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+        b = tl.load(b_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+        s = (a / (1.0 + tl.exp(-a))).to(tl.bfloat16).to(tl.float32)
+        tl.store(out_ptr + offs, (s * b).to(out_ptr.dtype.element_ty), mask=mask)
+
+    def ln_launch(x, a, c, a_strides, c_strides, S, T, eps, add_one):
+        C = x.shape[-1]
+        out = torch.empty_like(x)
+        block = triton.next_power_of_2(C)
+        _ln_kernel[(x.numel() // C,)](x, out, a, c, C, S, T, *a_strides, *c_strides, float(eps),
+                                      ADD_ONE=add_one, BLOCK=block, num_warps=8 if block >= 2048 else 4)
+        return out
+
+    def modulate(x, eps, scale, shift):  # x [B, T, S, C] contiguous; scale/shift [B, T, 1, C]
+        B, T, S, C = x.shape
+        return ln_launch(x, scale, shift, (scale.stride(0), scale.stride(1)),
+                         (shift.stride(0), shift.stride(1)), S, T, eps, True)
+
+    def layer_norm(x, eps, weight, bias):  # x [..., C] contiguous
+        rows = x.numel() // x.shape[-1]
+        return ln_launch(x, weight, bias, (0, 0), (0, 0), max(rows, 1), 1, eps, False)
+
+    def rms_launch(x, weight, eps, cos, sin, out):
+        d0, d1, d2, D = x.shape
+        R = d0 * d1 * d2
+        block_r = 16
+        rope = cos is not None
+        _rms_kernel[(triton.cdiv(R, block_r),)](
+            x, out, weight, cos if rope else weight, sin if rope else weight, R, d1, d2,
+            x.stride(0), x.stride(1), x.stride(2), out.stride(0), out.stride(1), out.stride(2),
+            float(eps), D=D, BLOCK_R=block_r, ROPE=rope, num_warps=4)
+        return out
+
+    def rms(x, weight, eps):  # any [d0, d1, d2, D] view; dense inputs keep their layout
+        return rms_launch(x, weight, eps, None, None, torch.empty_like(x))
+
+    def qk_rope(x, weight, eps, cos, sin):  # x [B, H, N, D] view -> same shape, stored [B, N, H, D]
+        B, H, N, D = x.shape
+        out = torch.empty((B, N, H, D), device=x.device, dtype=x.dtype).permute(0, 2, 1, 3)
+        return rms_launch(x, weight, eps, cos, sin, out)
+
+    def silu_mul(a, b):
+        out = torch.empty_like(a)
+        n = a.numel()
+        _silu_mul_kernel[(triton.cdiv(n, 4096),)](a, b, out, n, BLOCK=4096, num_warps=8)
+        return out
+
+    return {"modulate": modulate, "layer_norm": layer_norm, "qk_rope": qk_rope, "rms": rms,
+            "silu_mul": silu_mul}
+
+
+def _rope_cos_sin(rope, q, grid_size, frame_index=None, num_ref_latents=None, token_offset=0):
+    """The cos/sin rows LongCat's RotaryPositionalEmbedding.forward (@58eb336) uses for
+    this call, as [tokens, D] fp32, through its own caches (same keys, same values)."""
+    key_name = '.'.join([str(i) for i in grid_size]) + f"-{str(frame_index)}-{str(num_ref_latents)}"
+    if key_name not in rope.freqs_dict:
+        rope.register_grid_size(grid_size, key_name, frame_index, num_ref_latents)
+    cache_key = (rope.head_dim, tuple(rope.cp_split_hw or ()), key_name, q.device.type, q.device.index)
+    cached = rope._gpu_cos_sin_cache.get(cache_key)
+    if cached is None:
+        freqs_cis = rope.freqs_dict[key_name].to(q.device).float()
+        cached = (freqs_cis.cos()[None, None], freqs_cis.sin()[None, None])  # 'n d -> 1 1 n d'
+        rope._gpu_cos_sin_cache[cache_key] = cached
+    cos, sin = cached
+    n = q.shape[-2]
+    cos = cos[0, 0, token_offset:token_offset + n]
+    sin = sin[0, 0, token_offset:token_offset + n]
+    if cos.shape[0] != n:
+        raise ValueError(f"RoPE table has {cos.shape[0]} rows for {n} tokens")
+    return cos, sin
+
+
+def _install_fused(dit, dit_module, counter) -> int:
+    """Route LongCat's small steps through `_FUSED` while `_FUSE_ON[0]` is set. Everything
+    falls back to LongCat's own code per call when the op isn't available or the tensors
+    aren't the bf16 layouts the kernels expect. Returns the number of patched modules."""
+    F = torch.nn.functional
+    patched = 0
+    orig_modulate = dit_module.modulate_fp32
+
+    def modulate(norm_func, x, shift, scale):
+        fn = _FUSED.get("modulate")
+        if (fn is not None and _FUSE_ON[0] and _fusable(x, 4) and x.is_contiguous()
+                and getattr(norm_func, "weight", 0) is None and getattr(norm_func, "bias", 0) is None
+                and tuple(getattr(norm_func, "normalized_shape", ())) == (x.shape[-1],)
+                and shift.dtype == torch.float32 and scale.dtype == torch.float32
+                and tuple(shift.shape) == tuple(scale.shape) == (x.shape[0], x.shape[1], 1, x.shape[3])
+                and shift.stride(-1) == 1 and scale.stride(-1) == 1):
+            counter["modulate"] += 1
+            return fn(x, norm_func.eps, scale, shift)
+        return orig_modulate(norm_func, x, shift, scale)
+
+    dit_module.modulate_fp32 = modulate
+
+    def qk_fused_active():
+        return _FUSE_ON[0] and "qk_rope" in _FUSED
+
+    self_attn_norms = set()
+    for name, m in dit.named_modules():
+        if not name.startswith("blocks.") or not all(hasattr(m, a) for a in ("rope_3d", "q_norm", "k_norm")):
+            continue
+        if type(m.q_norm).__name__ != "RMSNorm_FP32" or type(m.k_norm).__name__ != "RMSNorm_FP32":
+            continue
+        qn, kn, rope = m.q_norm, m.k_norm, m.rope_3d
+        self_attn_norms |= {id(qn), id(kn)}
+
+        def q_norm(x, orig=qn.forward):  # folded into the RoPE kernel while fused
+            return x if qk_fused_active() else orig(x)
+
+        def k_norm(x, orig=kn.forward):
+            return x if qk_fused_active() else orig(x)
+
+        def rope_forward(q, k, grid_size, frame_index=None, num_ref_latents=None, token_offset=0,
+                         qn=qn, kn=kn, rope=rope, orig_q=qn.forward, orig_k=kn.forward, orig=rope.forward):
+            if not qk_fused_active():
+                return orig(q, k, grid_size, frame_index, num_ref_latents, token_offset)
+            D = q.shape[-1]
+            if not (_fusable(q, 4) and _fusable(k, 4) and k.shape == q.shape and D == rope.head_dim
+                    and D >= 2 and D & (D - 1) == 0 and qn.weight.dtype == kn.weight.dtype == torch.bfloat16):
+                return orig(orig_q(q), orig_k(k), grid_size, frame_index, num_ref_latents, token_offset)
+            cos, sin = _rope_cos_sin(rope, q, grid_size, frame_index, num_ref_latents, token_offset)
+            counter["qk_rope"] += 1
+            fn = _FUSED["qk_rope"]
+            return fn(q, qn.weight, qn.eps, cos, sin), fn(k, kn.weight, kn.eps, cos, sin)
+
+        qn.forward, kn.forward, rope.forward = q_norm, k_norm, rope_forward
+        patched += 1
+
+    for name, m in dit.named_modules():
+        if not name.startswith("blocks."):
+            continue
+        cls = type(m).__name__
+        if cls == "RMSNorm_FP32" and id(m) not in self_attn_norms:
+            def rms_forward(x, m=m, orig=m.forward):
+                fn = _FUSED.get("rms")
+                D = x.shape[-1]
+                if (fn is not None and _FUSE_ON[0] and _fusable(x, 4) and D == m.weight.shape[0]
+                        and D >= 2 and D & (D - 1) == 0 and m.weight.dtype == torch.bfloat16):
+                    counter["rms"] += 1
+                    return fn(x, m.weight, m.eps)
+                return orig(x)
+
+            m.forward = rms_forward
+            patched += 1
+        elif cls == "LayerNorm_FP32" and m.weight is not None and m.bias is not None:
+            def ln_forward(x, m=m, orig=m.forward):
+                fn = _FUSED.get("layer_norm")
+                if (fn is not None and _FUSE_ON[0] and _fusable(x) and x.is_contiguous()
+                        and tuple(m.normalized_shape) == (x.shape[-1],)):
+                    counter["layer_norm"] += 1
+                    return fn(x, m.eps, m.weight, m.bias)
+                return orig(x)
+
+            m.forward = ln_forward
+            patched += 1
+        elif cls == "FeedForwardSwiGLU":
+            def ffn_forward(x, m=m, orig=m.forward):
+                fn = _FUSED.get("silu_mul")
+                if fn is None or not _FUSE_ON[0] or not _fusable(x):
+                    return orig(x)
+                a, b = m.w1(x), m.w3(x)
+                if _fusable(a) and a.is_contiguous() and b.is_contiguous() and a.shape == b.shape and b.dtype == a.dtype:
+                    counter["silu_mul"] += 1
+                    return m.w2(fn(a, b))
+                return m.w2(F.silu(a) * b)
+
+            m.forward = ffn_forward
+            patched += 1
+    return patched
+
+
+def _fused_self_test(dit, orig_modulate, kernels: dict, unavailable: dict) -> str:
+    """Each kernel against LongCat's own code on block 0's real layers, in bf16. Passing
+    ops go into `_FUSED`; failing ones are recorded in `unavailable` and keep LongCat's path."""
+    F = torch.nn.functional
+    block = dit.blocks[0]
+    attn = block.attn
+    dev = next(dit.parameters()).device
+    g = torch.Generator(device=dev).manual_seed(0)
+    H, D = attn.num_heads, attn.head_dim
+    C = H * D
+
+    def rnd(*shape, dtype=torch.bfloat16, std=1.0):
+        return (torch.randn(*shape, device=dev, generator=g) * std).to(dtype)
+
+    def modulate_case():
+        x = rnd(1, 3, 200, C, std=4.0)
+        ada = rnd(1, 3, 1, 6 * C, dtype=torch.float32, std=0.2)
+        shift, scale = ada.chunk(6, dim=-1)[:2]  # strided views, as in the block
+        norm = block.mod_norm_attn
+        yield kernels["modulate"](x, norm.eps, scale, shift), orig_modulate(norm, x, shift, scale)
+
+    def layer_norm_case():
+        seen = set()
+        for _, m in block.named_modules():
+            if type(m).__name__ == "LayerNorm_FP32" and m.weight is not None and m.bias is not None:
+                c = m.normalized_shape[0]
+                if c in seen:
+                    continue
+                seen.add(c)
+                x = rnd(1, 300, c, std=3.0)
+                yield kernels["layer_norm"](x, m.eps, m.weight, m.bias), type(m).forward(m, x)
+
+    def qk_rope_case():
+        qn, kn, rope = attn.q_norm, attn.k_norm, attn.rope_3d
+        for grid, fi, nr, off in (((4, 8, 16), None, None, 0), ((6, 8, 16), 10, 1, 256)):
+            qkv = rnd(1, 512, 3, H, D, std=2.0)
+            q, k, _ = qkv.permute(2, 0, 3, 1, 4).unbind(0)  # strided views, as in Attention
+            rq, rk = type(rope).forward(rope, type(qn).forward(qn, q), type(kn).forward(kn, k),
+                                        grid, fi, nr, token_offset=off)
+            cos, sin = _rope_cos_sin(rope, q, grid, fi, nr, off)
+            yield kernels["qk_rope"](q, qn.weight, qn.eps, cos, sin), rq
+            yield kernels["qk_rope"](k, kn.weight, kn.eps, cos, sin), rk
+
+    def rms_case():
+        m = block.cross_attn.q_norm
+        x = rnd(1, 512, H, D, std=2.0)
+        yield kernels["rms"](x, m.weight, m.eps), type(m).forward(m, x)
+        xp = x.permute(0, 2, 1, 3)  # dense permuted view (audio cross-attention's q)
+        yield kernels["rms"](xp, m.weight, m.eps), type(m).forward(m, xp)
+        kv = rnd(1, 77, 2, H, D).permute(2, 0, 3, 1, 4)[0]  # non-dense view
+        yield kernels["rms"](kv, m.weight, m.eps), type(m).forward(m, kv)
+
+    def silu_mul_case():
+        a, b = rnd(1, 300, block.ffn.hidden_dim, std=2.0), rnd(1, 300, block.ffn.hidden_dim)
+        yield kernels["silu_mul"](a, b), F.silu(a) * b
+
+    cases = {"modulate": modulate_case, "layer_norm": layer_norm_case, "qk_rope": qk_rope_case,
+             "rms": rms_case, "silu_mul": silu_mul_case}
+    notes = []
+    with torch.no_grad():
+        for name, case in cases.items():
+            try:
+                same, total, worst_rel, worst_cos = 0, 0, 0.0, 1.0
+                for out, ref in case():
+                    if out.shape != ref.shape or out.dtype != ref.dtype:
+                        raise RuntimeError(f"got {tuple(out.shape)} {out.dtype}, want {tuple(ref.shape)} {ref.dtype}")
+                    o, r = out.float(), ref.float()
+                    worst_rel = max(worst_rel, ((o - r).norm() / r.norm()).item())
+                    worst_cos = min(worst_cos, F.cosine_similarity(o.flatten(), r.flatten(), dim=0).item())
+                    same += (o == r).sum().item()
+                    total += r.numel()
+                if not total or not (worst_rel < 0.01 and worst_cos > 0.9999):
+                    raise RuntimeError(f"mismatch: rel err {worst_rel:.4f}, cosine {worst_cos:.6f}")
+                _FUSED[name] = kernels[name]
+                notes.append(f"{name} {same / total:.1%} identical")
+            except Exception as exc:  # noqa: BLE001 - this op keeps LongCat's path
+                unavailable[f"fused_ops.{name}"] = repr(exc)
+                notes.append(f"{name} UNAVAILABLE ({exc!r})")
+    return ", ".join(notes)
+
+
 # Developer profiling (`profile` input): one continuation segment under torch.profiler,
 # kernels grouped by name, plus labelled ranges for the code the remaining speed-up ideas
 # target (LoRA branches, the fp32 norm/modulation helpers, RoPE).
@@ -1072,6 +1412,17 @@ class Runner(BaseRunner):
             dit.enable_lora_mix("dmd", "opsd", 1.0, 4)
             self.unavailable["merge_lora"] = repr(exc)
             print(f"[setup] merged add-ons unavailable ({exc!r}); requests use separate branches")
+        self.fused_calls = collections.Counter()
+        try:
+            import longcat_video.modules.avatar.longcat_video_dit_avatar as dit_module
+
+            note = _fused_self_test(dit, dit_module.modulate_fp32, _make_fused_kernels(), self.unavailable)
+            patched = _install_fused(dit, dit_module, self.fused_calls)
+            print(f"[setup] fused small steps on {patched} modules: {note}")
+        except Exception as exc:  # noqa: BLE001 - requests then use LongCat's own steps
+            _FUSED.clear()
+            self.unavailable["fused_ops"] = repr(exc)
+            print(f"[setup] fused small steps unavailable ({exc!r}); requests use LongCat's steps")
         self.sage = _SageAttention()
         if self.attention in ("fa3", "sdpa"):  # Sage plugs into LongCat's FA3 code path
             try:
@@ -1205,6 +1556,15 @@ class Runner(BaseRunner):
             ),
             default=True,
         ),
+        fused_ops: bool = Input(
+            description=(
+                "Run the model's small per-layer steps (normalisation, scale/shift, position "
+                "encoding, the feed-forward gate) as single fused GPU kernels. Faster; same maths "
+                "and precision, so the video differs only in small details. Turn off for "
+                "LongCat's original steps."
+            ),
+            default=True,
+        ),
         fp8_matmuls: bool = Input(
             description=(
                 "Experimental speed-up: run the video model's big matrix multiplies in FP8 (8-bit) on "
@@ -1244,6 +1604,9 @@ class Runner(BaseRunner):
         merge_on = bool(merge_lora) and self.merge_available
         _MERGE_ON[0] = merge_on
         self.merge_calls[0] = 0
+        fuse_on = bool(fused_ops) and bool(_FUSED)
+        _FUSE_ON[0] = fuse_on
+        self.fused_calls.clear()
         torch.cuda.reset_peak_memory_stats()
         if fp8_matmuls and not fp8_on:
             print(f"[predict] FP8 matmuls are unavailable on this machine "
@@ -1253,7 +1616,11 @@ class Runner(BaseRunner):
               + (f" sparse={sparse_attention}" if sparse_on else "")
               + (" sage=on" if sage_on else "")
               + (" fp8=on" if fp8_on else "")
-              + (" merge=on" if merge_on else " merge=off"))
+              + (" merge=on" if merge_on else " merge=off")
+              + (" fused=on" if fuse_on else " fused=off"))
+        missing = {k: v for k, v in self.unavailable.items() if k.startswith("fused_ops")}
+        if fused_ops and missing:
+            print(f"[predict] fused steps unavailable on this machine, using LongCat's: {missing}")
         if merge_lora and not merge_on:
             print(f"[predict] merged add-ons are unavailable on this machine "
                   f"({self.unavailable.get('merge_lora', '?')}); using separate branches")
@@ -1457,6 +1824,9 @@ class Runner(BaseRunner):
                 print(f"[predict] FP8 matmuls: {self.fp8_calls[0]} calls")
             if merge_on:
                 print(f"[predict] merged add-ons: {self.merge_calls[0]} layer calls")
+            if fuse_on:
+                print("[predict] fused steps: "
+                      + ", ".join(f"{k} {v}" for k, v in sorted(self.fused_calls.items())))
             print(f"[predict] peak GPU memory {torch.cuda.max_memory_allocated() / 1e9:.1f} GB")
             if sparse_on:
                 print(f"[predict] sparse attention: {self.sparse.calls['sparse']} sparse / "
@@ -1467,6 +1837,7 @@ class Runner(BaseRunner):
             _DENSE_OVERRIDE[0] = None
             _FP8_ON[0] = False
             _MERGE_ON[0] = False
+            _FUSE_ON[0] = False
             self.sparse.set(0.0)
             self.kv_cache.release()
             if hasattr(self.pipe, "_clear_cache"):
