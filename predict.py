@@ -37,6 +37,9 @@ from typing import Optional
 # with more parallel streams and sizes its buffers from RAM.
 os.environ.setdefault("HF_XET_HIGH_PERFORMANCE", "1")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+# Lets PyTorch grow its memory segments instead of leaving reserved-but-unusable gaps (the
+# first 720p run failed with 4.5 GB reserved and unallocated). Must be set before CUDA starts.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 # LongCat wraps the small sparse-attention helpers (block pooling, top-k) in torch.compile.
 # Eager they cost milliseconds; compiled, every new frame size would recompile mid-prediction.
 os.environ.setdefault("TORCH_COMPILE_DISABLE", "1")
@@ -1056,6 +1059,46 @@ def _profile_report(prof, wall: float, top: int = 18) -> list:
     return lines
 
 
+def _gpu_free_note() -> str:
+    free, total = torch.cuda.mem_get_info()
+    held = (total - free) / 1e9
+    reserved = torch.cuda.memory_reserved() / 1e9
+    return (f"{free / 1e9:.1f} of {total / 1e9:.1f} GB free; PyTorch reserves {reserved:.1f} GB, "
+            f"other CUDA users {max(held - reserved, 0):.1f} GB")
+
+
+def _offloadable_text_encoder(pipe, device) -> dict:
+    """Let the ~11 GB text encoder leave the GPU when a request needs the room (720p). It is
+    used once per prompt (later segments reuse LongCat's prompt cache), so: before it actually
+    encodes it is moved to `device` if needed; after each `encode_prompt` call, cache hit or
+    not, it is moved to the CPU while `state["offload"]` is set. Same weights, same maths.
+    Returns the state dict; `state["moves"]` lists (target, seconds) per move."""
+    state = {"offload": False, "moves": []}
+    inner, outer = pipe._get_t5_prompt_embeds, pipe.encode_prompt
+    target_gpu = torch.device("cuda", device) if isinstance(device, int) else torch.device(device)
+
+    def move(target) -> None:
+        te = pipe.text_encoder
+        if next(te.parameters()).device != target:
+            t0 = time.time()
+            te.to(target)
+            state["moves"].append((str(target), time.time() - t0))
+
+    def get_t5_prompt_embeds(*args, **kwargs):
+        move(target_gpu)  # encoding needs it on the GPU
+        return inner(*args, **kwargs)
+
+    def encode_prompt(*args, **kwargs):
+        try:
+            return outer(*args, **kwargs)
+        finally:
+            if state["offload"]:
+                move(torch.device("cpu"))
+
+    pipe._get_t5_prompt_embeds, pipe.encode_prompt = get_t5_prompt_embeds, encode_prompt
+    return state
+
+
 def _set_lora_mix(dit, mix_alpha: float, mix_steps: int) -> bool:
     """Set the per-request DMD/OPSD LoRA mix, leaving the same state as LongCat's
     `enable_lora_mix`. That call goes through `enable_loras`, whose `disable_all_loras` moves
@@ -1660,7 +1703,12 @@ class Runner(BaseRunner):
         dit.enable_lora_mix("dmd", "opsd", 1.0, 4)
 
         whisper_dir = str(AVATAR_DIR / "whisper-large-v3")
-        audio_encoder = get_audio_encoder(whisper_dir, MODEL_TYPE).to(self.device)
+        audio_encoder = get_audio_encoder(whisper_dir, MODEL_TYPE)
+        if getattr(audio_encoder, "decoder", None) is not None:
+            # LongCat only calls audio_encoder.encoder (pipeline get_audio_embedding); the fp32
+            # decoder would take ~3.6 GB of GPU memory for nothing.
+            audio_encoder.decoder = None
+        audio_encoder = audio_encoder.to(self.device)
         audio_feature_extractor = get_audio_feature_extractor(whisper_dir, MODEL_TYPE)
 
         self.tmp_root = FsPath(tempfile.mkdtemp(prefix="longcat-"))
@@ -1673,7 +1721,8 @@ class Runner(BaseRunner):
             separator.onnx_execution_provider = [
                 (
                     "CUDAExecutionProvider",
-                    {"device_id": self.device, "cudnn_conv_algo_search": "HEURISTIC"},
+                    {"device_id": self.device, "cudnn_conv_algo_search": "HEURISTIC",
+                     "arena_extend_strategy": "kSameAsRequested"},
                 )
             ]
         separator.load_model("Kim_Vocal_2.onnx")
@@ -1767,12 +1816,14 @@ class Runner(BaseRunner):
         self.timer.wrap(self.pipe.dit, "forward", "dit")
         self.timer.wrap(self.pipe.vae, "encode", "vae encode")
         self.timer.wrap(self.pipe, "_decode_video_latents", "vae decode")
+        self.text_encoder_state = _offloadable_text_encoder(self.pipe, self.device)
         self.timer.wrap(self.pipe, "encode_prompt", "text")
         self._warm_up_audio()
         self.boot.mark("audio warm-up")
         self.boot.log(
             f"[setup] ready in {time.time() - t_setup:.0f}s, "
-            f"{torch.cuda.memory_allocated() / 1e9:.1f} GB on GPU"
+            f"{torch.cuda.memory_allocated() / 1e9:.1f} GB on GPU "
+            f"({_gpu_free_note()})"
         )
 
     def _warm_up_audio(self) -> None:
@@ -1926,6 +1977,9 @@ class Runner(BaseRunner):
         _FP8_ON[0] = fp8_on
         self.fp8_calls[0] = 0
         merge_on = bool(merge_lora) and self.merge_available
+        # 720p needs the text encoder's ~11 GB: it moves to CPU memory after encoding.
+        self.text_encoder_state["offload"] = resolution == "720p"
+        self.text_encoder_state["moves"].clear()
         _MERGE_ON[0] = merge_on
         self.merge_calls[0] = 0
         fuse_on = bool(fused_ops) and bool(_FUSED)
@@ -2152,6 +2206,8 @@ class Runner(BaseRunner):
             if fuse_on:
                 print("[predict] fused steps: "
                       + ", ".join(f"{k} {v}" for k, v in sorted(self.fused_calls.items())))
+            for target, secs in self.text_encoder_state["moves"]:
+                print(f"[predict] text encoder moved to {target} in {secs:.1f}s")
             print(f"[predict] peak GPU memory {torch.cuda.max_memory_allocated() / 1e9:.1f} GB")
             if sparse_on:
                 print(f"[predict] sparse attention: {self.sparse.calls['sparse']} sparse / "
