@@ -461,43 +461,50 @@ def _make_fused_kernels() -> dict:
         y = d * rstd * a + c
         tl.store(out_ptr + row * C + offs, y.to(out_ptr.dtype.element_ty), mask=mask)
 
+    @triton.jit(do_not_specialize=["N", "sb", "sh", "sn", "ob", "oh", "on"])
+    def _qk_rope_kernel(x_ptr, out_ptr, w_ptr, cos_ptr, sin_ptr, N, sb, sh, sn, ob, oh, on, eps,
+                        H: tl.constexpr, D: tl.constexpr):
+        # One token, all H heads of a [B, H, N, D] view: RMSNorm as LongCat does it
+        # ((x * rsqrt(mean(x^2) + eps)) -> bf16, * weight -> bf16), then RoPE with this
+        # token's cos/sin row, loaded once for all heads. rotate_half maps each pair
+        # (2j, 2j+1) to (-x[2j+1], x[2j]), so every element reads its partner d ^ 1.
+        pid = tl.program_id(0).to(tl.int64)
+        b = pid // N
+        n = pid % N
+        h = tl.arange(0, H)
+        d = tl.arange(0, D)
+        base = b * sb + n * sn + h[:, None] * sh
+        x = tl.load(x_ptr + base + d[None, :]).to(tl.float32)
+        xp = tl.load(x_ptr + base + (d ^ 1)[None, :]).to(tl.float32)
+        rstd = tl.rsqrt(tl.sum(x * x, axis=1) / D + eps)
+        w = tl.load(w_ptr + d).to(tl.float32)
+        wp = tl.load(w_ptr + (d ^ 1)).to(tl.float32)
+        nx = (x * rstd[:, None]).to(tl.bfloat16).to(tl.float32)
+        nx = (nx * w[None, :]).to(tl.bfloat16).to(tl.float32)
+        npart = (xp * rstd[:, None]).to(tl.bfloat16).to(tl.float32)
+        npart = (npart * wp[None, :]).to(tl.bfloat16).to(tl.float32)
+        cs = tl.load(cos_ptr + n * D + d)
+        sn_ = tl.load(sin_ptr + n * D + d)
+        sign = tl.where(d % 2 == 0, -1.0, 1.0)
+        y = nx * cs[None, :] + (sign[None, :] * npart) * sn_[None, :]
+        tl.store(out_ptr + b * ob + n * on + h[:, None] * oh + d[None, :], y.to(out_ptr.dtype.element_ty))
+
     @triton.jit(do_not_specialize=["R", "d1", "d2", "s0", "s1", "s2", "o0", "o1", "o2"])
-    def _rms_kernel(x_ptr, out_ptr, w_ptr, cos_ptr, sin_ptr, R, d1, d2, s0, s1, s2, o0, o1, o2,
-                    eps, D: tl.constexpr, BLOCK_R: tl.constexpr, ROPE: tl.constexpr):
-        # BLOCK_R rows of D (one head of one token each) from a strided [d0, d1, d2, D]
-        # tensor: RMSNorm as LongCat does it ((x * rsqrt(mean(x^2) + eps)) -> bf16, * weight
-        # -> bf16), then optionally RoPE with cos/sin row = the token index (dim 2), whose
-        # rotate_half maps each pair (2j, 2j+1) to (-x[2j+1], x[2j]).
+    def _rms_kernel(x_ptr, out_ptr, w_ptr, R, d1, d2, s0, s1, s2, o0, o1, o2, eps,
+                    D: tl.constexpr, BLOCK_R: tl.constexpr):
+        # BLOCK_R rows of D from a strided [d0, d1, d2, D] tensor, RMSNorm as above.
         r = tl.program_id(0).to(tl.int64) * BLOCK_R + tl.arange(0, BLOCK_R)
-        rmask = r < R
+        m = (r < R)[:, None]
         i2 = r % d2
         i1 = (r // d2) % d1
         i0 = r // (d2 * d1)
-        j = tl.arange(0, D // 2)
-        m = rmask[:, None]
-        src = (i0 * s0 + i1 * s1 + i2 * s2)[:, None] + 2 * j[None, :]
-        xe = tl.load(x_ptr + src, mask=m, other=0.0).to(tl.float32)
-        xo = tl.load(x_ptr + src + 1, mask=m, other=0.0).to(tl.float32)
-        rstd = tl.rsqrt((tl.sum(xe * xe, axis=1) + tl.sum(xo * xo, axis=1)) / D + eps)
-        ne = (xe * rstd[:, None]).to(tl.bfloat16).to(tl.float32)
-        no = (xo * rstd[:, None]).to(tl.bfloat16).to(tl.float32)
-        we = tl.load(w_ptr + 2 * j).to(tl.float32)
-        wo = tl.load(w_ptr + 2 * j + 1).to(tl.float32)
-        ne = (ne * we[None, :]).to(tl.bfloat16).to(tl.float32)
-        no = (no * wo[None, :]).to(tl.bfloat16).to(tl.float32)
-        if ROPE:
-            cs = (i2 * D)[:, None] + 2 * j[None, :]
-            ce = tl.load(cos_ptr + cs, mask=m, other=0.0)
-            co = tl.load(cos_ptr + cs + 1, mask=m, other=0.0)
-            se = tl.load(sin_ptr + cs, mask=m, other=0.0)
-            so = tl.load(sin_ptr + cs + 1, mask=m, other=0.0)
-            oe = ne * ce - no * se
-            oo = no * co + ne * so
-            ne = oe
-            no = oo
-        dst = (i0 * o0 + i1 * o1 + i2 * o2)[:, None] + 2 * j[None, :]
-        tl.store(out_ptr + dst, ne.to(out_ptr.dtype.element_ty), mask=m)
-        tl.store(out_ptr + dst + 1, no.to(out_ptr.dtype.element_ty), mask=m)
+        d = tl.arange(0, D)
+        x = tl.load(x_ptr + (i0 * s0 + i1 * s1 + i2 * s2)[:, None] + d[None, :], mask=m, other=0.0).to(tl.float32)
+        rstd = tl.rsqrt(tl.sum(x * x, axis=1) / D + eps)
+        nx = (x * rstd[:, None]).to(tl.bfloat16).to(tl.float32)
+        nx = nx * tl.load(w_ptr + d).to(tl.float32)[None, :]
+        tl.store(out_ptr + (i0 * o0 + i1 * o1 + i2 * o2)[:, None] + d[None, :],
+                 nx.to(out_ptr.dtype.element_ty), mask=m)
 
     @triton.jit(do_not_specialize=["n"])
     def _silu_mul_kernel(a_ptr, b_ptr, out_ptr, n, BLOCK: tl.constexpr):
@@ -508,6 +515,20 @@ def _make_fused_kernels() -> dict:
         b = tl.load(b_ptr + offs, mask=mask, other=0.0).to(tl.float32)
         s = (a / (1.0 + tl.exp(-a))).to(tl.bfloat16).to(tl.float32)
         tl.store(out_ptr + offs, (s * b).to(out_ptr.dtype.element_ty), mask=mask)
+
+    @triton.jit(do_not_specialize=["C", "S", "T", "g_sb", "g_st"])
+    def _gated_add_kernel(x_ptr, s_ptr, g_ptr, out_ptr, C, S, T, g_sb, g_st, BLOCK: tl.constexpr):
+        # LongCat's residual update: (x + gate * s) in fp32 -> bf16, gate per (batch, frame).
+        row = tl.program_id(0).to(tl.int64)
+        offs = tl.arange(0, BLOCK)
+        mask = offs < C
+        bt = row // S
+        b = bt // T
+        t = bt % T
+        x = tl.load(x_ptr + row * C + offs, mask=mask, other=0.0).to(tl.float32)
+        sv = tl.load(s_ptr + row * C + offs, mask=mask, other=0.0).to(tl.float32)
+        g = tl.load(g_ptr + b * g_sb + t * g_st + offs, mask=mask, other=0.0).to(tl.float32)
+        tl.store(out_ptr + row * C + offs, (x + g * sv).to(out_ptr.dtype.element_ty), mask=mask)
 
     def ln_launch(x, a, c, a_strides, c_strides, S, T, eps, add_one):
         C = x.shape[-1]
@@ -526,24 +547,22 @@ def _make_fused_kernels() -> dict:
         rows = x.numel() // x.shape[-1]
         return ln_launch(x, weight, bias, (0, 0), (0, 0), max(rows, 1), 1, eps, False)
 
-    def rms_launch(x, weight, eps, cos, sin, out):
-        d0, d1, d2, D = x.shape
-        R = d0 * d1 * d2
-        block_r = 16
-        rope = cos is not None
-        _rms_kernel[(triton.cdiv(R, block_r),)](
-            x, out, weight, cos if rope else weight, sin if rope else weight, R, d1, d2,
-            x.stride(0), x.stride(1), x.stride(2), out.stride(0), out.stride(1), out.stride(2),
-            float(eps), D=D, BLOCK_R=block_r, ROPE=rope, num_warps=4)
-        return out
-
     def rms(x, weight, eps):  # any [d0, d1, d2, D] view; dense inputs keep their layout
-        return rms_launch(x, weight, eps, None, None, torch.empty_like(x))
+        d0, d1, d2, D = x.shape
+        out = torch.empty_like(x)
+        R = d0 * d1 * d2
+        _rms_kernel[(triton.cdiv(R, 32),)](
+            x, out, weight, R, d1, d2, x.stride(0), x.stride(1), x.stride(2),
+            out.stride(0), out.stride(1), out.stride(2), float(eps), D=D, BLOCK_R=32, num_warps=4)
+        return out
 
     def qk_rope(x, weight, eps, cos, sin):  # x [B, H, N, D] view -> same shape, stored [B, N, H, D]
         B, H, N, D = x.shape
         out = torch.empty((B, N, H, D), device=x.device, dtype=x.dtype).permute(0, 2, 1, 3)
-        return rms_launch(x, weight, eps, cos, sin, out)
+        _qk_rope_kernel[(B * N,)](x, out, weight, cos, sin, N, x.stride(0), x.stride(1), x.stride(2),
+                                  out.stride(0), out.stride(1), out.stride(2), float(eps),
+                                  H=H, D=D, num_warps=8)
+        return out
 
     def silu_mul(a, b):
         out = torch.empty_like(a)
@@ -551,8 +570,16 @@ def _make_fused_kernels() -> dict:
         _silu_mul_kernel[(triton.cdiv(n, 4096),)](a, b, out, n, BLOCK=4096, num_warps=8)
         return out
 
+    def gated_add(x, gate, xs, T):  # x, xs [B, N, C] contiguous; gate [B, T, 1, C] fp32
+        B, N, C = x.shape
+        out = torch.empty_like(x)
+        block = triton.next_power_of_2(C)
+        _gated_add_kernel[(B * N,)](x, xs, gate, out, C, N // T, T, gate.stride(0), gate.stride(1),
+                                    BLOCK=block, num_warps=8 if block >= 2048 else 4)
+        return out
+
     return {"modulate": modulate, "layer_norm": layer_norm, "qk_rope": qk_rope, "rms": rms,
-            "silu_mul": silu_mul}
+            "silu_mul": silu_mul, "gated_add": gated_add}
 
 
 def _rope_cos_sin(rope, q, grid_size, frame_index=None, num_ref_latents=None, token_offset=0):
@@ -574,6 +601,112 @@ def _rope_cos_sin(rope, q, grid_size, frame_index=None, num_ref_latents=None, to
     if cos.shape[0] != n:
         raise ValueError(f"RoPE table has {cos.shape[0]} rows for {n} tokens")
     return cos, sin
+
+
+def _gated_residual(x, gate, xs, T, counter):
+    """LongCat's residual update `(x + gate * xs).to(x.dtype)`, computed in fp32, with
+    gate [B, T, 1, C] per frame: one fused kernel when the tensors allow it."""
+    B, N, C = x.shape
+    fn = _FUSED.get("gated_add")
+    if (fn is not None and _fusable(x, 3) and x.is_contiguous() and _fusable(xs) and xs.is_contiguous()
+            and xs.numel() == x.numel() and gate.dtype == torch.float32 and gate.stride(-1) == 1
+            and tuple(gate.shape) == (B, T, 1, C) and N % T == 0):
+        counter["gated_add"] += 1
+        return fn(x, gate, xs, T)
+    with torch.amp.autocast(device_type="cuda", dtype=torch.float32):
+        out = x + (gate * xs.view(B, -1, N // T, C)).view(B, -1, C)
+    return out.to(x.dtype)
+
+
+def _fused_block_forward(self, mod, counter, x, y, t, y_seqlen, latent_shape, num_cond_latents=None,
+                         return_kv=False, kv_cache=None, skip_crs_attn=False, num_ref_latents=None,
+                         audio_hidden_states=None, ref_img_index=None, mask_frame_range=None,
+                         token_ref_target_masks=None, human_num=None):
+    """LongCatAvatarSingleStreamBlock.forward (@58eb336), line for line, except that the
+    three gated residual updates go through `_gated_residual` (one kernel each instead of
+    a multiply, an add and a cast over the whole residual stream)."""
+    amp32 = functools.partial(torch.amp.autocast, device_type="cuda", dtype=torch.float32)
+    x_dtype = x.dtype
+    B, N, C = x.shape
+    T, _, _ = latent_shape
+    with amp32():
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = \
+            self.adaLN_modulation(t).unsqueeze(2).chunk(6, dim=-1)
+    x_m = mod.modulate_fp32(self.mod_norm_attn, x.view(B, T, -1, C), shift_msa, scale_msa).view(B, N, C)
+    if kv_cache is not None:
+        kv_cache = (kv_cache[0].to(x.device), kv_cache[1].to(x.device))
+        attn_outputs = self.attn.forward_with_kv_cache(
+            x_m, shape=latent_shape, num_cond_latents=num_cond_latents, kv_cache=kv_cache,
+            num_ref_latents=num_ref_latents, ref_img_index=ref_img_index,
+            mask_frame_range=mask_frame_range, ref_target_masks=token_ref_target_masks)
+    else:
+        attn_outputs = self.attn(
+            x_m, shape=latent_shape, num_cond_latents=num_cond_latents, return_kv=return_kv,
+            num_ref_latents=num_ref_latents, ref_img_index=ref_img_index,
+            mask_frame_range=mask_frame_range, ref_target_masks=token_ref_target_masks)
+    if return_kv:
+        x_s, kv_cache, x_ref_attn_map = attn_outputs
+    else:
+        x_s, x_ref_attn_map = attn_outputs
+    x = _gated_residual(x, gate_msa, x_s, T, counter).to(x_dtype)
+
+    if not skip_crs_attn:
+        if kv_cache is not None:
+            num_cond_latents = None
+        x = x + self.cross_attn(self.pre_crs_attn_norm(x), y, y_seqlen, num_cond_latents=num_cond_latents,
+                                shape=latent_shape)
+    if not skip_crs_attn:
+        if kv_cache is not None:
+            num_cond_latents = 0
+        with amp32():
+            audio_shift_mca, audio_scale_mca, audio_gate_mca = \
+                self.audio_adaLN_modulation(t[:, num_cond_latents:]).unsqueeze(2).chunk(3, dim=-1)
+        audio_output_cond, audio_output_noise = self.audio_cross_attn(
+            self.pre_video_crs_attn_norm(x), self.pre_audio_crs_attn_norm(audio_hidden_states),
+            shape=latent_shape, num_cond_latents=num_cond_latents, x_ref_attn_map=x_ref_attn_map,
+            human_num=human_num)
+        t_noise = T - num_cond_latents
+        with amp32():
+            audio_output_noise = mod.modulate_fp32(self.mod_norm_attn, audio_output_noise.view(B, t_noise, -1, C),
+                                                   audio_shift_mca, audio_scale_mca).view(B, -1, C)
+        if audio_output_cond is None:
+            x = _gated_residual(x, audio_gate_mca, audio_output_noise, t_noise, counter).to(x_dtype)
+        else:
+            with amp32():
+                audio_add_x = (audio_gate_mca * audio_output_noise.view(B, t_noise, -1, C)).view(B, -1, C)
+                audio_add_x = torch.cat([audio_output_cond, audio_add_x], dim=1).contiguous()
+            x = (x + audio_add_x).to(x_dtype)
+
+    x_m = mod.modulate_fp32(self.mod_norm_ffn, x.view(B, -1, N // T, C), shift_mlp, scale_mlp).view(B, -1, C)
+    x_s = self.ffn(x_m)
+    x = _gated_residual(x, gate_mlp, x_s, T, counter).to(x_dtype)
+    if return_kv:
+        return x, kv_cache
+    return x
+
+
+def _lean_forward_with_kv_cache(self, x, shape, num_cond_latents, kv_cache, num_ref_latents, ref_img_index):
+    """LongCat's Attention.forward_with_kv_cache (@58eb336) for the case this runner uses
+    (mask_frame_range 0, one person, no block-sparse attention), with the cached and new
+    keys/values joined straight into FlashAttention's [B, S, H, D] layout: one copy each
+    instead of a join plus the copy FlashAttention's wrapper makes. Same values."""
+    B, N, C = x.shape
+    qkv = self.qkv(x)
+    q, k, v = qkv.view(B, N, 3, self.num_heads, self.head_dim).permute((2, 0, 3, 1, 4)).unbind(0)
+    q, k = self.q_norm(q), self.k_norm(k)
+    N_t, N_h, N_w = shape
+    k_cache, v_cache = kv_cache
+    assert k_cache.shape[0] == v_cache.shape[0] and k_cache.shape[0] in [1, B]
+    if k_cache.shape[0] == 1:
+        k_cache = k_cache.repeat(B, 1, 1, 1)
+        v_cache = v_cache.repeat(B, 1, 1, 1)
+    q, k = self.rope_3d(q, k, (N_t + num_cond_latents, N_h, N_w), ref_img_index, num_ref_latents,
+                        token_offset=k_cache.shape[2])
+    k_full = torch.cat([k_cache.transpose(1, 2), k.transpose(1, 2)], dim=1).transpose(1, 2)
+    v_full = torch.cat([v_cache.transpose(1, 2), v.transpose(1, 2)], dim=1).transpose(1, 2)
+    x = self._process_attn(q, k_full, v_full, shape)
+    x = x.transpose(1, 2).reshape(B, N, C)
+    return self.proj(x), None
 
 
 def _install_fused(dit, dit_module, counter) -> int:
@@ -632,9 +765,10 @@ def _install_fused(dit, dit_module, counter) -> int:
                          qn=qn, kn=kn, rope=rope, orig_q=qn.forward, orig_k=kn.forward, orig=rope.forward):
             if not qk_fused_active():
                 return orig(q, k, grid_size, frame_index, num_ref_latents, token_offset)
-            D = q.shape[-1]
+            H, D = q.shape[1], q.shape[-1]
             if not (_fusable(q, 4) and _fusable(k, 4) and k.shape == q.shape and D == rope.head_dim
-                    and D >= 2 and D & (D - 1) == 0 and qn.weight.dtype == kn.weight.dtype == torch.bfloat16):
+                    and D >= 2 and D & (D - 1) == 0 and H >= 1 and H & (H - 1) == 0
+                    and qn.weight.dtype == kn.weight.dtype == torch.bfloat16):
                 return orig(orig_q(q), orig_k(k), grid_size, frame_index, num_ref_latents, token_offset)
             cos, sin = _rope_cos_sin(rope, q, grid_size, frame_index, num_ref_latents, token_offset)
             counter["qk_rope"] += 1
@@ -642,7 +776,32 @@ def _install_fused(dit, dit_module, counter) -> int:
             return fn(q, qn.weight, qn.eps, cos, sin), fn(k, kn.weight, kn.eps, cos, sin)
 
         qn.forward, kn.forward, rope.forward = q_norm, k_norm, rope_forward
+        if hasattr(m, "forward_with_kv_cache"):
+            def forward_with_kv_cache(x, shape=None, num_cond_latents=None, kv_cache=None, num_ref_latents=None,
+                                      ref_img_index=None, mask_frame_range=None, ref_target_masks=None,
+                                      attn=m, orig=m.forward_with_kv_cache):
+                if (_FUSE_ON[0] and "kv_layout" in _FUSED and not mask_frame_range and ref_target_masks is None
+                        and num_cond_latents and not getattr(attn, "enable_bsa", False)):
+                    counter["kv_layout"] += 1
+                    return _lean_forward_with_kv_cache(attn, x, shape, num_cond_latents, kv_cache,
+                                                       num_ref_latents, ref_img_index)
+                return orig(x, shape=shape, num_cond_latents=num_cond_latents, kv_cache=kv_cache,
+                            num_ref_latents=num_ref_latents, ref_img_index=ref_img_index,
+                            mask_frame_range=mask_frame_range, ref_target_masks=ref_target_masks)
+
+            m.forward_with_kv_cache = forward_with_kv_cache
         patched += 1
+
+    for name, m in dit.named_modules():
+        if name.startswith("blocks.") and name.count(".") == 1 and all(
+                hasattr(m, a) for a in ("adaLN_modulation", "audio_adaLN_modulation", "attn", "ffn")):
+            def block_forward(*args, blk=m, orig=m.forward, **kwargs):
+                if _FUSE_ON[0] and "gated_add" in _FUSED:
+                    return _fused_block_forward(blk, dit_module, counter, *args, **kwargs)
+                return orig(*args, **kwargs)
+
+            m.forward = block_forward
+            patched += 1
 
     for name, m in dit.named_modules():
         if not name.startswith("blocks."):
@@ -743,8 +902,25 @@ def _fused_self_test(dit, orig_modulate, kernels: dict, unavailable: dict) -> st
         a, b = rnd(1, 300, block.ffn.hidden_dim, std=2.0), rnd(1, 300, block.ffn.hidden_dim)
         yield kernels["silu_mul"](a, b), F.silu(a) * b
 
+    def gated_add_case():
+        x, xs = rnd(1, 3 * 200, C, std=8.0), rnd(1, 3 * 200, C)
+        gate = rnd(1, 3, 1, 6 * C, dtype=torch.float32, std=0.5).chunk(6, dim=-1)[2]
+        with torch.amp.autocast(device_type="cuda", dtype=torch.float32):
+            ref = x + (gate * xs.view(1, -1, 200, C)).view(1, -1, C)
+        yield kernels["gated_add"](x, gate, xs, 3), ref.to(x.dtype)
+
+    def kv_layout_case():  # pure layout change: must match LongCat's cached attention
+        n_h, n_w, n_t, n_c = 4, 8, 3, 2
+        x = rnd(1, n_t * n_h * n_w, C)
+        kc, vc = rnd(1, H, n_c * n_h * n_w, D), rnd(1, H, n_c * n_h * n_w, D)
+        ref = type(attn).forward_with_kv_cache(attn, x, shape=(n_t, n_h, n_w), num_cond_latents=n_c,
+                                               kv_cache=(kc, vc), num_ref_latents=1, ref_img_index=10,
+                                               mask_frame_range=0, ref_target_masks=None)[0]
+        yield _lean_forward_with_kv_cache(attn, x, (n_t, n_h, n_w), n_c, (kc, vc), 1, 10)[0], ref
+
     cases = {"modulate": modulate_case, "layer_norm": layer_norm_case, "qk_rope": qk_rope_case,
-             "rms": rms_case, "silu_mul": silu_mul_case}
+             "rms": rms_case, "silu_mul": silu_mul_case, "gated_add": gated_add_case,
+             "kv_layout": kv_layout_case}
     notes = []
     with torch.no_grad():
         for name, case in cases.items():
@@ -760,7 +936,7 @@ def _fused_self_test(dit, orig_modulate, kernels: dict, unavailable: dict) -> st
                     total += r.numel()
                 if not total or not (worst_rel < 0.01 and worst_cos > 0.9999):
                     raise RuntimeError(f"mismatch: rel err {worst_rel:.4f}, cosine {worst_cos:.6f}")
-                _FUSED[name] = kernels[name]
+                _FUSED[name] = kernels.get(name, True)  # kv_layout is plain torch, no kernel
                 notes.append(f"{name} {same / total:.1%} identical")
             except Exception as exc:  # noqa: BLE001 - this op keeps LongCat's path
                 unavailable[f"fused_ops.{name}"] = repr(exc)
