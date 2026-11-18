@@ -28,6 +28,7 @@ machine first boots. That keeps the image small enough to build on a GitHub runn
 | `resolution` | `480p` (up to 90 s) or `720p` (up to 15 s). |
 | `max_duration` | Longer audio is cut at this point. |
 | `isolate_voice` | Strips music or noise before lip-sync. The output keeps the original audio. |
+| `steps` | 8 (default) is the distilled schedule. 6 and 4 are opt-in drafts that run a subset of the same 8 trained noise levels (6: levels 0,2,4,5,6,7; 4: levels 0,2,4,7), about 20% and 40% faster; quality is being measured. `step_indices` (developer) picks any subset, e.g. `0,4,6,7`. |
 | `mix_steps`, `mix_alpha` | The LoRA mix. Leave these at the defaults unless faces distort. |
 | `seed` | Use it to reproduce a run. |
 | `merge_lora` | On by default. Folds the LoRA add-ons into each layer's weights just before it multiplies (one matrix multiply instead of a separate add-on branch, with the merged weight built in a temporary buffer, so the stored weights never change). Measured on an 8 s clip: about 10–13% faster (99.7 s, vs 114.9 s with `false` on the same version and 110.7 s on the previous version; DiT time 11–12% lower in every chunk). Same scene, pose and lip timing, but small details such as blinks, hair and smoke differ (SSIM 0.90 vs `false`): the per-layer rounding differs by about 0.3%, and the 8 denoising steps amplify that into a slightly different take. Set it to `false` for LongCat's original path. |

@@ -93,7 +93,11 @@ FPS = 25
 AUDIO_STRIDE = 1
 NUM_FRAMES = 93
 NUM_COND_FRAMES = 13
-NUM_STEPS = 8
+NUM_STEPS = 8  # the distilled schedule: 8 trained noise levels
+# Opt-in drafts run a subset of those same trained levels (indices into the 8), always starting
+# from pure noise (0). 6 drops two of the four early DMD steps; 4 keeps two DMD and two OPSD
+# steps and still ends on the last trained level.
+STEP_SUBSETS = {8: (0, 1, 2, 3, 4, 5, 6, 7), 6: (0, 2, 4, 5, 6, 7), 4: (0, 2, 4, 7)}
 GUIDANCE = 1.0
 REF_IMG_INDEX = 10
 MASK_FRAME_RANGE = 0
@@ -1067,6 +1071,39 @@ def _gpu_free_note() -> str:
             f"other CUDA users {max(held - reserved, 0):.1f} GB")
 
 
+def _step_indices(steps: int, override: str = "") -> tuple:
+    """Which of the 8 trained noise levels to run: STEP_SUBSETS[steps], or a developer
+    override like "0,4,6,7" (sorted, unique, within 0-7, starting at 0 = pure noise)."""
+    if not override.strip():
+        return STEP_SUBSETS[int(steps)]
+    try:
+        idx = tuple(int(x) for x in override.replace(" ", "").split(","))
+    except ValueError:
+        raise ValueError(f"step_indices must be comma-separated integers, got {override!r}") from None
+    if not idx or idx[0] != 0 or list(idx) != sorted(set(idx)) or idx[-1] >= NUM_STEPS:
+        raise ValueError(f"step_indices must start at 0, increase, and stay below {NUM_STEPS}: {override!r}")
+    return idx
+
+
+def _subset_schedule(pipe) -> dict:
+    """Make the pipeline's distilled schedule run only `state["indices"]` of its 8 trained
+    noise levels (LongCat's avatar-v1.5 branch always returns all 8, whatever step count is
+    asked for). None = all 8, untouched. The scheduler's shift is elementwise, so this is the
+    same subset of the shifted levels too."""
+    state = {"indices": None}
+    orig = pipe.get_timesteps_sigmas
+
+    def get_timesteps_sigmas(sampling_steps, use_distill=False):
+        idx = state["indices"]
+        sigmas = orig(NUM_STEPS if idx is not None else sampling_steps, use_distill=use_distill)
+        if idx is None or len(sigmas) != NUM_STEPS:
+            return sigmas
+        return sigmas[list(idx)]
+
+    pipe.get_timesteps_sigmas = get_timesteps_sigmas
+    return state
+
+
 def _offloadable_text_encoder(pipe, device) -> dict:
     """Let the ~11 GB text encoder leave the GPU when a request needs the room (720p). It is
     used once per prompt (later segments reuse LongCat's prompt cache), so: before it actually
@@ -1817,6 +1854,7 @@ class Runner(BaseRunner):
         self.timer.wrap(self.pipe.vae, "encode", "vae encode")
         self.timer.wrap(self.pipe, "_decode_video_latents", "vae decode")
         self.text_encoder_state = _offloadable_text_encoder(self.pipe, self.device)
+        self.schedule_state = _subset_schedule(self.pipe)
         self.timer.wrap(self.pipe, "encode_prompt", "text")
         self._warm_up_audio()
         self.boot.mark("audio warm-up")
@@ -1896,6 +1934,22 @@ class Runner(BaseRunner):
         isolate_voice: bool = Input(
             description="Strip music and background noise from the audio before driving the lips (the output keeps your original audio).",
             default=True,
+        ),
+        steps: int = Input(
+            description=(
+                "Denoising steps. 8 is the trained default. 6 and 4 run a subset of the same "
+                "trained noise levels for a faster draft (about 20% / 40% less time); the "
+                "picture and lip-sync may lose quality."
+            ),
+            default=8,
+            choices=[8, 6, 4],
+        ),
+        step_indices: str = Input(
+            description=(
+                "For developers: comma-separated indices (0-7) of the 8 trained noise levels to "
+                "run, starting at 0, e.g. \"0,4,6,7\". Overrides steps."
+            ),
+            default="",
         ),
         mix_steps: int = Input(
             description="Advanced: leading denoising steps (of 8) that use the DMD LoRA mix. Higher can steady structure; 0 = OPSD only.",
@@ -2074,14 +2128,22 @@ class Runner(BaseRunner):
                 centers = torch.clamp(centers, min=0, max=full_audio_emb.shape[0] - 1)
                 return full_audio_emb[centers][None, ...].to(self.device)
 
-            # 2. Per-request LoRA mix: only the multipliers (see _set_lora_mix).
+            # 2. Steps and the per-request LoRA mix (only the multipliers, see _set_lora_mix).
+            # mix_steps counts trained levels; with a subset the switch moves to the number
+            # of kept levels before it.
+            indices = _step_indices(steps, step_indices)
+            self.schedule_state["indices"] = None if indices == STEP_SUBSETS[NUM_STEPS] else indices
+            dmd_steps = sum(1 for i in indices if i < int(mix_steps))
+            if self.schedule_state["indices"] is not None:
+                print(f"[predict] {len(indices)} steps: trained levels {','.join(map(str, indices))} "
+                      f"({dmd_steps} with the DMD mix)")
             with self.timer.phase("lora mix"):
-                _set_lora_mix(self.pipe.dit, float(mix_alpha), int(mix_steps))
+                _set_lora_mix(self.pipe.dit, float(mix_alpha), dmd_steps)
             generator = torch.Generator(device=self.device).manual_seed(seed)
             common = dict(
                 prompt=prompt,
                 negative_prompt=NEGATIVE_PROMPT,
-                num_inference_steps=NUM_STEPS,
+                num_inference_steps=len(indices),
                 text_guidance_scale=GUIDANCE,
                 audio_guidance_scale=GUIDANCE,
                 generator=generator,
@@ -2219,6 +2281,7 @@ class Runner(BaseRunner):
             _FP8_ON[0] = False
             _MERGE_ON[0] = False
             _FUSE_ON[0] = False
+            self.schedule_state["indices"] = None
             self.sparse.set(0.0)
             self.kv_cache.release()
             if hasattr(self.pipe, "_clear_cache"):
