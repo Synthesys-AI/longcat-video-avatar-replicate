@@ -582,6 +582,18 @@ def _install_fused(dit, dit_module, counter) -> int:
     aren't the bf16 layouts the kernels expect. Returns the number of patched modules."""
     F = torch.nn.functional
     patched = 0
+    emb = getattr(dit, "x_embedder", None)
+    if emb is not None:
+        # LongCat's PatchEmbed3D returns a transposed view ([B, N, C] stored as [B, C, N]) and
+        # every block's residual add keeps that layout, so the norms on the residual stream
+        # can't read whole rows. Store it row by row once per forward; values are unchanged
+        # (no matmul reads the residual directly, only through the norms).
+        def embed_forward(*args, orig=emb.forward, **kwargs):
+            out = orig(*args, **kwargs)
+            return out.contiguous() if _FUSE_ON[0] and torch.is_tensor(out) else out
+
+        emb.forward = embed_forward
+        patched += 1
     orig_modulate = dit_module.modulate_fp32
 
     def modulate(norm_func, x, shift, scale):

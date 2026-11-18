@@ -162,9 +162,15 @@ class Block(nn.Module):
         self.ffn = FeedForwardSwiGLU(C, 96)
 
 
+class PatchEmbed3D(nn.Module):
+    def forward(self, x):  # LongCat's flatten=True path: [B, C, T, H, W] -> transposed [B, N, C] view
+        return x.flatten(2).transpose(1, 2)
+
+
 class Dit(nn.Module):
     def __init__(self):
         super().__init__()
+        self.x_embedder = PatchEmbed3D()
         self.blocks = nn.ModuleList([Block(), Block()])
 
 
@@ -214,17 +220,18 @@ MIRRORS = {
 }
 
 
-def run_all(dit, mod, x, cases):
+def run_all(dit, mod, latents, cases):
     blk = dit.blocks[0]
-    outs = []
-    for shape, fi, nr, off in cases:
-        outs += list(blk.attn(x, shape, fi, nr, token_offset=off))
-    x4 = x.view(1, 2, -1, C)
+    x = dit.x_embedder(latents)  # the residual stream, as the blocks receive it
+    # As in LongCat's block, layers read the residual only through a norm.
     ada = torch.randn(1, 2, 1, 6 * C, generator=torch.Generator().manual_seed(1))
     shift, scale = ada.chunk(6, dim=-1)[:2]
-    outs += [mod.modulate_fp32(blk.mod_norm_attn, x4, shift, scale), blk.pre_crs_attn_norm(x),
-             blk.cross_attn(x), blk.ffn(x)]
-    return outs
+    x_m = mod.modulate_fp32(blk.mod_norm_attn, x.view(1, 2, -1, C), shift, scale).view(1, -1, C)
+    outs = [x_m]
+    for shape, fi, nr, off in cases:
+        outs += list(blk.attn(x_m, shape, fi, nr, token_offset=off))
+    xn = blk.pre_crs_attn_norm(x)
+    return outs + [xn, blk.cross_attn(xn), blk.ffn(x_m)]
 
 
 CASES = [((2, 4, 8), None, None, 0), ((3, 4, 8), 10, 1, 32)]  # plain, then a cached-frames offset
@@ -262,10 +269,28 @@ def test_a_broken_kernel_is_left_out():
     assert "fused_ops.qk_rope" in unavailable and "qk_rope UNAVAILABLE" in note
 
 
+def latents(dtype=BF):
+    return torch.randn(1, C, 2, 4, 8).to(dtype)  # 64 tokens
+
+
+@torch.no_grad()
+def test_residual_stream_is_row_major_only_while_fused():
+    dit, _, _ = fresh()
+    lat = latents()
+    off = dit.x_embedder(lat)
+    assert not off.is_contiguous(), "LongCat's own layout when off"
+    FUSE_ON[0] = True
+    try:
+        on = dit.x_embedder(lat)
+    finally:
+        FUSE_ON[0] = False
+    assert on.is_contiguous() and torch.equal(on, off)
+
+
 @torch.no_grad()
 def test_fused_route_matches_longcat_end_to_end():
     dit, mod, counter = fresh()
-    x = torch.randn(1, 64, C).to(BF)
+    x = latents()
     ref = run_all(dit, mod, x, CASES)
     FUSE_ON[0] = True
     try:
@@ -277,7 +302,7 @@ def test_fused_route_matches_longcat_end_to_end():
         assert o.shape == r.shape and o.dtype == r.dtype, i
         torch.testing.assert_close(o.float(), r.float(), rtol=0.02, atol=0.02, msg=f"output {i}")
         assert (o == r).float().mean() > 0.9, f"output {i}: {(o == r).float().mean():.3f} identical"
-    q = out[0]
+    q = out[1]
     assert q.permute(0, 2, 1, 3).is_contiguous(), "q should come out in FlashAttention's [B, S, H, D] layout"
 
 
@@ -300,17 +325,18 @@ def test_rope_rows_follow_offset_and_reference_frame():
 @torch.no_grad()
 def test_off_switch_and_missing_ops_use_longcat():
     dit, mod, counter = fresh()
-    x = torch.randn(1, 64, C).to(BF)
+    x = latents()
     ref = run_all(dit, mod, x, CASES)
     assert sum(counter.values()) == 0
     FUSED.pop("qk_rope")  # q/k norms must then run normally, not be skipped
+    FUSED.pop("modulate")  # (so the attention input is LongCat's exactly)
     FUSE_ON[0] = True
     try:
         out = run_all(dit, mod, x, CASES)
     finally:
         FUSE_ON[0] = False
-    assert "qk_rope" not in counter
-    for o, r in zip(out[:4], ref[:4]):
+    assert "qk_rope" not in counter and "modulate" not in counter
+    for o, r in zip(out[:5], ref[:5]):  # modulate output, then q/k for both cases
         assert torch.equal(o, r)
 
 
@@ -318,7 +344,7 @@ def test_off_switch_and_missing_ops_use_longcat():
 def test_unsupported_tensors_fall_back_exactly():
     dit, mod, counter = fresh()
     dit.float()  # fp32 model: no kernel takes these
-    x = torch.randn(1, 64, C)
+    x = latents(torch.float32)
     ref = run_all(dit, mod, x, CASES)
     FUSE_ON[0] = True
     try:
@@ -333,11 +359,11 @@ def test_unsupported_tensors_fall_back_exactly():
 def test_only_the_right_modules_are_patched():
     FUSED.clear()
     dit, mod = build()
-    assert install_fused(dit, mod, collections.Counter()) == 2 * (1 + 1 + 2 + 1)  # attn, cross q_norm, 2 affine LNs, ffn
+    assert install_fused(dit, mod, collections.Counter()) == 1 + 2 * (1 + 1 + 2 + 1)  # embedder; per block attn, cross q_norm, 2 affine LNs, ffn
     blk = dit.blocks[0]
     assert "forward" not in vars(blk.mod_norm_attn), "no-affine LN is reached through modulate"
     assert mod.modulate_fp32 is not modulate_fp32
-    for m in (blk.attn.q_norm, blk.attn.k_norm, blk.attn.rope_3d, blk.cross_attn.q_norm, blk.pre_crs_attn_norm, blk.ffn):
+    for m in (dit.x_embedder, blk.attn.q_norm, blk.attn.k_norm, blk.attn.rope_3d, blk.cross_attn.q_norm, blk.pre_crs_attn_norm, blk.ffn):
         assert "forward" in vars(m)
 
 
