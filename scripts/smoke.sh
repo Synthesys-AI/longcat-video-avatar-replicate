@@ -52,5 +52,16 @@ done
 
 echo "----- logs (tail) -----"
 jq -r '.logs // ""' p.json 2>/dev/null | tail -80
-jq '{status, output, error, metrics}' p.json 2>/dev/null
+jq '{status, output, error, metrics, created_at, started_at, completed_at}' p.json 2>/dev/null
+# Queue + cold boot = created -> started (a fresh machine downloads ~63 GB first).
+python3 - <<'PY' || true
+import datetime, json, re
+p = json.load(open("p.json"))
+def t(key):
+    m = re.match(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(\.\d+)?", p.get(key) or "")
+    return datetime.datetime.fromisoformat(m.group(1)).timestamp() + float(m.group(2) or 0) if m else None
+created, started = t("created_at"), t("started_at")
+if created and started:
+    print(f"waited {started - created:.0f}s before the prediction started")
+PY
 [ "$status" = "succeeded" ]

@@ -32,7 +32,10 @@ from contextlib import contextmanager
 from pathlib import Path as FsPath
 from typing import Optional
 
-os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
+# Both weight repos live on Hugging Face's Xet storage, which huggingface_hub fetches with
+# hf_xet (HF_HUB_ENABLE_HF_TRANSFER has no effect on Xet files). High-performance mode starts
+# with more parallel streams and sizes its buffers from RAM.
+os.environ.setdefault("HF_XET_HIGH_PERFORMANCE", "1")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 # LongCat wraps the small sparse-attention helpers (block pooling, top-k) in torch.compile.
 # Eager they cost milliseconds; compiled, every new frame size would recompile mid-prediction.
@@ -1308,29 +1311,72 @@ def _plan_chunks(target_frames: int) -> list:
     return plan
 
 
-def _download_weights() -> None:
+class _BootLog:
+    """Setup's stage times and notes. Setup's own output never reaches a prediction's logs,
+    so the first prediction on each machine prints them once (`report`)."""
+
+    def __init__(self):
+        self.t_mark = time.time()
+        self.stages, self.lines = [], []
+        self.pending = True
+
+    def log(self, text: str) -> None:
+        print(text)
+        self.lines.append(text)
+
+    def mark(self, stage: str) -> None:
+        """Close the stage that ran since the previous mark."""
+        now = time.time()
+        self.stages.append((stage, now - self.t_mark))
+        self.t_mark = now
+
+    def report(self) -> list:
+        self.pending = False
+        total = sum(t for _, t in self.stages)
+        head = (f"[setup] this machine's boot (printed once): setup {total:.0f}s = "
+                + ", ".join(f"{name} {t:.0f}s" for name, t in self.stages))
+        return [head] + self.lines
+
+
+def _start_weight_downloads(log) -> dict:
+    """Start both pinned repos downloading at once in background threads; returns
+    {"avatar": future, "base": future}, each resolving to the seconds it took (0 when the
+    disk already had it). Setup loads the text encoder and VAE as soon as "base" lands."""
+    from concurrent.futures import ThreadPoolExecutor
+    from importlib import metadata
+
     from huggingface_hub import snapshot_download
 
     WEIGHTS_ROOT.mkdir(parents=True, exist_ok=True)
     free_gb = shutil.disk_usage(WEIGHTS_ROOT).free / 1e9
-    print(f"[setup] {free_gb:.0f} GB free at {WEIGHTS_ROOT}")
-    for repo, revision, local_dir, patterns in (
-        (AVATAR_REPO, AVATAR_REVISION, AVATAR_DIR, AVATAR_FILES),
-        (BASE_REPO, BASE_REVISION, BASE_DIR, BASE_FILES),
-    ):
+    try:
+        xet = metadata.version("hf-xet")
+    except metadata.PackageNotFoundError:
+        xet = "not installed"
+    log(f"[setup] {free_gb:.0f} GB free at {WEIGHTS_ROOT}; hf_xet {xet}, "
+        f"HF_XET_HIGH_PERFORMANCE={os.environ.get('HF_XET_HIGH_PERFORMANCE')}")
+
+    def fetch(repo, revision, local_dir, patterns):
         marker = local_dir / f".complete-{revision}"
         if marker.exists():
-            continue
+            return 0.0
         t0 = time.time()
-        snapshot_download(
-            repo_id=repo,
-            revision=revision,
-            local_dir=str(local_dir),
-            allow_patterns=patterns,
-            max_workers=16,
-        )
+        snapshot_download(repo_id=repo, revision=revision, local_dir=str(local_dir),
+                          allow_patterns=patterns, max_workers=16)
         marker.touch()
-        print(f"[setup] downloaded {repo}@{revision[:8]} in {time.time() - t0:.0f}s")
+        secs = time.time() - t0
+        gb = sum(f.stat().st_size for f in local_dir.rglob("*") if f.is_file()) / 1e9
+        log(f"[setup] downloaded {repo}@{revision[:8]}: {gb:.1f} GB in {secs:.0f}s "
+            f"({gb * 1000 / max(secs, 1e-6):.0f} MB/s, both repos at once)")
+        return secs
+
+    pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="weights")
+    futures = {
+        "avatar": pool.submit(fetch, AVATAR_REPO, AVATAR_REVISION, AVATAR_DIR, AVATAR_FILES),
+        "base": pool.submit(fetch, BASE_REPO, BASE_REVISION, BASE_DIR, BASE_FILES),
+    }
+    pool.shutdown(wait=False)
+    return futures
 
 
 def _sdpa(q, k, v, softmax_scale=None, causal=False):
@@ -1532,7 +1578,8 @@ def _install_attention_backend() -> str:
 class Runner(BaseRunner):
     def setup(self) -> None:
         t_setup = time.time()
-        _download_weights()
+        self.boot = _BootLog()
+        downloads = _start_weight_downloads(self.boot.log)  # runs while CUDA and the kernels set up
 
         from transformers import AutoTokenizer, UMT5EncoderModel
         from audio_separator.separator import Separator
@@ -1570,7 +1617,10 @@ class Runner(BaseRunner):
         self.device = 0
         # FA3 and the SDPA fallback both go through LongCat's FA3 code path; FA2 is its own.
         self.attention = _install_attention_backend()
+        self.boot.mark(f"CUDA init + {self.attention} attention, while downloading")
 
+        downloads["base"].result()
+        self.boot.mark("waiting for the text-encoder/VAE repo")
         tokenizer = AutoTokenizer.from_pretrained(str(BASE_DIR), subfolder="tokenizer")
         text_encoder = UMT5EncoderModel.from_pretrained(
             str(BASE_DIR), subfolder="text_encoder", torch_dtype=torch.bfloat16
@@ -1578,6 +1628,9 @@ class Runner(BaseRunner):
         vae = AutoencoderKLWan.from_pretrained(
             str(BASE_DIR), subfolder="vae", torch_dtype=torch.bfloat16
         )
+        self.boot.mark("load text encoder + VAE")
+        downloads["avatar"].result()
+        self.boot.mark("waiting for the avatar repo")
         scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
             str(AVATAR_DIR), subfolder="scheduler", torch_dtype=torch.bfloat16
         )
@@ -1637,9 +1690,10 @@ class Runner(BaseRunner):
             model_type=MODEL_TYPE,
         )
         self.pipe.to(self.device)
+        self.boot.mark("load DiT, LoRAs, audio models; move to GPU")
         vp = self.pipe.video_processor
         vp.postprocess_video = _gpu_postprocess_video(vp.postprocess_video)
-        print(f"[setup] VAE: {_speed_up_vae(self.pipe.vae)}; frames to uint8 on the GPU")
+        self.boot.log(f"[setup] VAE: {_speed_up_vae(self.pipe.vae)}; frames to uint8 on the GPU")
         self.kv_cache = _MixAwareKVCache(self.pipe)
 
         import longcat_video.modules.avatar.attention as avatar_attention
@@ -1648,10 +1702,10 @@ class Runner(BaseRunner):
         self.sparse = _SparseAttention(dit, avatar_attention.flash_attn_bsa_3d, _dense_bhsd)
         avatar_attention.flash_attn_bsa_3d = self.sparse.attend
         try:
-            print(f"[setup] sparse attention available ({self.sparse.self_test()})")
+            self.boot.log(f"[setup] sparse attention available ({self.sparse.self_test()})")
         except Exception as exc:  # noqa: BLE001 - the input then runs dense
             self.unavailable["sparse_attention"] = repr(exc)
-            print(f"[setup] sparse attention unavailable ({exc!r}); requests run dense")
+            self.boot.log(f"[setup] sparse attention unavailable ({exc!r}); requests run dense")
         self.fp8_available = False
         self.fp8_calls = [0]
         try:
@@ -1659,10 +1713,10 @@ class Runner(BaseRunner):
             note = _fp8_self_test(fp8_linear)
             layers = _install_fp8(dit, fp8_linear, self.fp8_calls)
             self.fp8_available = True
-            print(f"[setup] FP8 matmuls available on {layers} layers ({note})")
+            self.boot.log(f"[setup] FP8 matmuls available on {layers} layers ({note})")
         except Exception as exc:  # noqa: BLE001 - the input then runs in bf16
             self.unavailable["fp8_matmuls"] = repr(exc)
-            print(f"[setup] FP8 matmuls unavailable ({exc!r}); requests run in bf16")
+            self.boot.log(f"[setup] FP8 matmuls unavailable ({exc!r}); requests run in bf16")
         self.merge_available = False
         self.merge_calls = [0]
         branch_factory = dit._create_multi_lora_forward
@@ -1671,31 +1725,31 @@ class Runner(BaseRunner):
             dit.enable_lora_mix("dmd", "opsd", 1.0, 4)  # rebuild the wrapped forwards through it
             note = _merge_self_test(dit)
             self.merge_available = True
-            print(f"[setup] merged add-ons available ({note})")
+            self.boot.log(f"[setup] merged add-ons available ({note})")
         except Exception as exc:  # noqa: BLE001 - requests then use LongCat's branches
             dit._create_multi_lora_forward = branch_factory
             dit.enable_lora_mix("dmd", "opsd", 1.0, 4)
             self.unavailable["merge_lora"] = repr(exc)
-            print(f"[setup] merged add-ons unavailable ({exc!r}); requests use separate branches")
+            self.boot.log(f"[setup] merged add-ons unavailable ({exc!r}); requests use separate branches")
         self.fused_calls = collections.Counter()
         try:
             import longcat_video.modules.avatar.longcat_video_dit_avatar as dit_module
 
             note = _fused_self_test(dit, dit_module.modulate_fp32, _make_fused_kernels(), self.unavailable)
             patched = _install_fused(dit, dit_module, self.fused_calls)
-            print(f"[setup] fused small steps on {patched} modules: {note}")
+            self.boot.log(f"[setup] fused small steps on {patched} modules: {note}")
         except Exception as exc:  # noqa: BLE001 - requests then use LongCat's own steps
             _FUSED.clear()
             self.unavailable["fused_ops"] = repr(exc)
-            print(f"[setup] fused small steps unavailable ({exc!r}); requests use LongCat's steps")
+            self.boot.log(f"[setup] fused small steps unavailable ({exc!r}); requests use LongCat's steps")
         self.sage = _SageAttention()
         if self.attention in ("fa3", "sdpa"):  # Sage plugs into LongCat's FA3 code path
             try:
                 self.sage.kernel, source = _load_sage()
-                print(f"[setup] SageAttention available from {source} ({self.sage.self_test()})")
+                self.boot.log(f"[setup] SageAttention available from {source} ({self.sage.self_test()})")
             except Exception as exc:  # noqa: BLE001 - the input then runs on FA3
                 self.unavailable["sage_attention"] = repr(exc)
-                print(f"[setup] SageAttention unavailable ({exc!r}); requests use {self.attention}")
+                self.boot.log(f"[setup] SageAttention unavailable ({exc!r}); requests use {self.attention}")
         else:
             self.unavailable["sage_attention"] = f"needs the FA3 code path, attention is {self.attention}"
         # While sparse attention is on, image mode picks sizes from the 128-px bucket table.
@@ -1708,13 +1762,15 @@ class Runner(BaseRunner):
 
         self.pipe.get_condition_shape = get_condition_shape
 
+        self.boot.mark("kernel self-tests and patches")
         self.timer = _PhaseTimer(torch.cuda.synchronize)
         self.timer.wrap(self.pipe.dit, "forward", "dit")
         self.timer.wrap(self.pipe.vae, "encode", "vae encode")
         self.timer.wrap(self.pipe, "_decode_video_latents", "vae decode")
         self.timer.wrap(self.pipe, "encode_prompt", "text")
         self._warm_up_audio()
-        print(
+        self.boot.mark("audio warm-up")
+        self.boot.log(
             f"[setup] ready in {time.time() - t_setup:.0f}s, "
             f"{torch.cuda.memory_allocated() / 1e9:.1f} GB on GPU"
         )
@@ -1750,9 +1806,9 @@ class Runner(BaseRunner):
                 speech, fps=FPS * AUDIO_STRIDE, device=self.device, sample_rate=rate,
                 model_type=MODEL_TYPE, use_loudness_norm=False,
             )
-            print(f"[setup] audio warm-up done in {time.time() - t0:.1f}s")
+            self.boot.log(f"[setup] audio warm-up done in {time.time() - t0:.1f}s")
         except Exception as exc:  # noqa: BLE001 - warm-up is only an optimisation
-            print(f"[setup] audio warm-up skipped after {time.time() - t0:.1f}s ({exc!r})")
+            self.boot.log(f"[setup] audio warm-up skipped after {time.time() - t0:.1f}s ({exc!r})")
         finally:
             shutil.rmtree(self.tmp_root / "warmup", ignore_errors=True)
             _torch_gc()
@@ -1858,6 +1914,9 @@ class Runner(BaseRunner):
         from longcat_video.audio_process.vocal_separator import separate_vocals
 
         t_start = time.time()
+        if self.boot.pending:
+            for line in self.boot.report():
+                print(line)
         if seed is None:
             seed = secrets.randbelow(2**31)
         sparse_on = self.sparse.set(float(sparse_attention))
