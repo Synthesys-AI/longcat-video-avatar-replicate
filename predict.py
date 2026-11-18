@@ -107,10 +107,18 @@ MASK_FRAME_RANGE = 0
 # Replicate stops a prediction at 30 min. Stop starting new segments in time to
 # finish the one in flight and encode, and return the video made so far.
 TIME_BUDGET_SECONDS = 26 * 60
-# Measured on one H100 with FlashAttention 3: ~50 s per 480p segment (3.2 s of new video;
-# 58.6 s with FA2), plus ~50 s of audio prep and encoding. 90 s of video is 28 segments,
-# about 25 min. 720p is NOT measured yet (estimated ~4x slower per segment).
-MAX_DURATION = {"480p": 90.0, "720p": 15.0}
+# Longest video per resolution and step count, so the render ends well inside that budget.
+# Measured on one H100, per 3.2 s continuation segment: 480p 28 s (8 steps), 22 s (6), 16 s
+# (4); 720p 98 s (8), 51 s (4); 720p with 6 steps is estimated at ~75 s. The first segment
+# costs ~15-20% more. So 720p: 45 s (8 steps) ~22 min, 60 s (6) ~23.5 min, 90 s (4) ~24 min.
+MAX_DURATION = {"480p": {8: 90.0, 6: 90.0, 4: 90.0}, "720p": {8: 45.0, 6: 60.0, 4: 90.0}}
+
+
+def _max_duration(resolution: str, n_steps: int) -> float:
+    """Longest allowed video for this resolution and number of denoising steps; a custom
+    step subset gets the limit of the next larger preset (5 -> 6, 7 -> 8)."""
+    caps = MAX_DURATION[resolution]
+    return caps[min((k for k in caps if k >= n_steps), default=max(caps))]
 
 NEGATIVE_PROMPT = (
     "Close-up, Bright tones, overexposed, static, blurred details, subtitles, style, works, "
@@ -1926,7 +1934,10 @@ class Runner(BaseRunner):
             default="16:9",
         ),
         max_duration: float = Input(
-            description="Longest video to make, in seconds. Longer audio is cut. Limits: 90 s at 480p, 15 s at 720p (Replicate stops runs at 30 min).",
+            description=(
+                "Longest video to make, in seconds. Longer audio is cut. Limits: 90 s at 480p; at "
+                "720p 45 s with 8 steps, 60 s with 6, 90 s with 4 (Replicate stops runs at 30 min)."
+            ),
             default=30.0,
             ge=1.0,
             le=90.0,
@@ -2068,7 +2079,12 @@ class Runner(BaseRunner):
         work.mkdir(parents=True, exist_ok=True)
         try:
             # 1. Audio: normalise to 44.1 kHz stereo wav, cut to the allowed length.
-            cap = min(float(max_duration), MAX_DURATION[resolution])
+            indices = _step_indices(steps, step_indices)  # validated before any billed work
+            limit = _max_duration(resolution, len(indices))
+            cap = min(float(max_duration), limit)
+            if float(max_duration) > limit:
+                print(f"[predict] {resolution} with {len(indices)} steps is limited to {limit:.0f}s "
+                      f"(max_duration {float(max_duration):.0f}s)")
             speech_wav = work / "speech.wav"
             with self.timer.phase("audio convert"):
                 subprocess.run(
@@ -2131,7 +2147,6 @@ class Runner(BaseRunner):
             # 2. Steps and the per-request LoRA mix (only the multipliers, see _set_lora_mix).
             # mix_steps counts trained levels; with a subset the switch moves to the number
             # of kept levels before it.
-            indices = _step_indices(steps, step_indices)
             self.schedule_state["indices"] = None if indices == STEP_SUBSETS[NUM_STEPS] else indices
             dmd_steps = sum(1 for i in indices if i < int(mix_steps))
             if self.schedule_state["indices"] is not None:
