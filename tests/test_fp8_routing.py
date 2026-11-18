@@ -17,7 +17,7 @@ _ns = {"torch": torch}
 for node in ast.parse(SRC.read_text()).body:
     if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id in {"_FP8_ON", "FP8_MIN_ROWS"} for t in node.targets):
         exec(compile(ast.Module([node], []), str(SRC), "exec"), _ns)
-    if isinstance(node, ast.FunctionDef) and node.name in {"_fp8_targets", "_install_fp8"}:
+    if isinstance(node, ast.FunctionDef) and node.name in {"_fp8_targets", "_install_fp8", "_linear_maybe_fp8"}:
         exec(compile(ast.Module([node], []), str(SRC), "exec"), _ns)
 fp8_targets, install_fp8, FP8_ON = _ns["_fp8_targets"], _ns["_install_fp8"], _ns["_FP8_ON"]
 

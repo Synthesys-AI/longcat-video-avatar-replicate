@@ -30,6 +30,7 @@ machine first boots. That keeps the image small enough to build on a GitHub runn
 | `isolate_voice` | Strips music or noise before lip-sync. The output keeps the original audio. |
 | `mix_steps`, `mix_alpha` | The LoRA mix. Leave these at the defaults unless faces distort. |
 | `seed` | Use it to reproduce a run. |
+| `merge_lora` | On by default. Folds the LoRA add-ons into each layer's weights just before it multiplies (one matrix multiply instead of a separate add-on branch, with the merged weight built in a temporary buffer, so the stored weights never change). The output matches the separate-branch path up to bf16 rounding. Set it to `false` for LongCat's original path. |
 | `sage_attention` | Experimental, off by default. 8-bit attention (SageAttention2, from the same kernel hub) for the video's attention. Frame sizes stay the same; the picture may differ slightly from the default. Measured on an 8 s clip: about 2.5% faster, video nearly identical (SSIM 0.97). |
 | `fp8_matmuls` | Experimental, off by default. FP8 for the DiT's big matrix multiplies on the H100. Measured on an 8 s clip: about 5% faster (6.6% with `sage_attention`), small visual differences (SSIM 0.90), same lip timing. |
 | `sparse_attention` | Experimental, off by default. The share of attention to skip (e.g. `0.75`), using LongCat's block-sparse kernel. While it is on, frame sizes snap to 128 px blocks (16:9 at 480p renders at 896×512, not 832×480). Faces or lip-sync may soften. |

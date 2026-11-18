@@ -240,17 +240,27 @@ def _install_fp8(dit, fp8_linear, counter: list) -> int:
     keep running in bf16 on top."""
     targets = _fp8_targets(dit)
     for _, lin in targets:
+        lin._fp8 = (fp8_linear, counter)
+
         def forward(x, lin=lin):
-            if _FP8_ON[0] and x.numel() >= FP8_MIN_ROWS * x.shape[-1]:
-                counter[0] += 1
-                return fp8_linear(x, lin.weight, lin.bias)
-            return torch.nn.functional.linear(x, lin.weight, lin.bias)
+            return _linear_maybe_fp8(lin, x, lin.weight)
 
         if hasattr(lin, "org_forward"):
             lin.org_forward = forward
         else:
             lin.forward = forward
     return len(targets)
+
+
+def _linear_maybe_fp8(lin, x, weight):
+    """`lin`'s linear with `weight`: the FP8 linear while `_FP8_ON[0]` is set on a layer
+    `_install_fp8` picked (and the call is big enough), else plain bf16 F.linear."""
+    fp8 = getattr(lin, "_fp8", None)
+    if fp8 is not None and _FP8_ON[0] and x.numel() >= FP8_MIN_ROWS * x.shape[-1]:
+        fp8_linear, counter = fp8
+        counter[0] += 1
+        return fp8_linear(x, weight, lin.bias)
+    return torch.nn.functional.linear(x, weight, lin.bias)
 
 
 def _make_fp8_linear():
@@ -307,6 +317,103 @@ def _fp8_self_test(fp8_linear) -> str:
     if out.shape != ref.shape or not (rel < 0.06 and cos > 0.998):
         raise RuntimeError(f"self-test mismatch: rel err {rel:.4f}, cosine {cos:.5f}")
     return f"self-test rel err {rel:.4f}, cosine {cos:.5f}"
+
+
+# Merged add-ons (`merge_lora` input, on by default). LongCat runs each LoRA add-on as a
+# side branch of its layer: x·Aᵀ, then ·Bᵀ, two scalings and two additions, each a full
+# pass over the activations (~37k tokens × up to 16k features per call at 480p). The
+# profile put that at ~5.5 s of a 43 s segment. Here, while an add-on is active and the
+# call is big enough, the layer's effective weight W + s·B·A is built in a temporary
+# buffer (one addmm per add-on) and the activations go through ONE matmul. W itself is
+# never written to, so nothing drifts from video to video, and the add-on state (the
+# DMD/OPSD switch at `mix_steps`) is still read at call time.
+_MERGE_ON = [False]
+# Building W' costs ~2 passes over W; the branch costs ~9 passes over the output. So merge
+# when rows >= in_features / 4 (video tokens); short calls (text tokens) keep the branch.
+MERGE_ROWS_PER_FEATURE = 0.25
+
+
+def _merged_weight(weight, active):
+    """weight + sum(scale * up @ down) over the `active` (lora, scale) pairs, in a new
+    buffer; `weight` is untouched. `up` is a Linear or LongCat's LoRAUPParallel, whose
+    block i maps the i-th rank slice of the down projection to the i-th slice of rows."""
+    out = torch.empty_like(weight)
+    for k, (lora, scale) in enumerate(active):
+        down = lora.lora_down.weight
+        up = lora.lora_up
+        ups = [b.weight for b in up.blocks] if hasattr(up, "blocks") else [up.weight]
+        r, rows = down.shape[0] // len(ups), out.shape[0] // len(ups)
+        for i, b in enumerate(ups):
+            rs, ds = slice(i * rows, (i + 1) * rows), down[i * r:(i + 1) * r]
+            if k == 0:
+                torch.addmm(weight[rs], b, ds, alpha=scale, out=out[rs])
+            else:
+                out[rs].addmm_(b, ds, alpha=scale)
+    return out
+
+
+def _make_merging_factory(branch_factory, counter: list):
+    """Wrap LongCat's `dit._create_multi_lora_forward(module, loras)` (called by
+    `enable_loras`, so on every request's `enable_lora_mix`): the forward it returns merges
+    while `_MERGE_ON[0]` is set and the call is big enough, else runs LongCat's branch."""
+
+    def create(module, loras):
+        branch = branch_factory(module, loras)
+        if type(module) is not torch.nn.Linear:  # e.g. a QuantizedLinear: keep the branch
+            return branch
+        scales = [float(lora.alpha_scale) for lora in loras]  # constant buffer: read once
+        min_rows = module.in_features * MERGE_ROWS_PER_FEATURE
+
+        def forward(x, *args, **kwargs):
+            if (not _MERGE_ON[0] or args or kwargs or torch.is_grad_enabled()
+                    or x.numel() < min_rows * x.shape[-1]):
+                return branch(x, *args, **kwargs)  # (with grad on, W' would cut the add-ons' grads)
+            active = [(lora, lora.multiplier * sc) for lora, sc in zip(loras, scales) if lora.use_lora]
+            if not active:
+                return branch(x)
+            counter[0] += 1
+            return _linear_maybe_fp8(module, x, _merged_weight(module.weight, active))
+
+        forward.merges_lora, forward.loras = True, loras
+        return forward
+
+    return create
+
+
+def _merge_self_test(dit, rows: int = 2048) -> str:
+    """Merged vs LongCat's branch path on the biggest wrapped layer (and the biggest one
+    with a split up-projection, if any), in both add-on states of the mix."""
+    wrapped = [m for _, m in dit.named_modules()
+               if getattr(m.forward, "merges_lora", False) and type(m) is torch.nn.Linear]
+    if not wrapped:
+        raise RuntimeError("no add-on layers went through the merging forward")
+    split = [m for m in wrapped if any(hasattr(lora.lora_up, "blocks") for lora in m.forward.loras)]
+    layers = [max(group, key=lambda m: m.weight.numel()) for group in (wrapped, split) if group]
+    worst_rel, worst_cos, share = 0.0, 1.0, 1.0
+    try:
+        with torch.no_grad():
+            for step in (0, 10**6):  # before and after the mix's switch
+                dit.set_lora_mix_step(step)
+                for layer in layers:
+                    g = torch.Generator(device=layer.weight.device).manual_seed(0)
+                    x = torch.randn(rows, layer.in_features, device=layer.weight.device,
+                                    dtype=layer.weight.dtype, generator=g)
+                    _MERGE_ON[0] = False
+                    ref = layer(x).float()
+                    base = layer.org_forward(x).float()
+                    _MERGE_ON[0] = True
+                    out = layer(x).float()
+                    rel = ((out - ref).norm() / ref.norm()).item()
+                    cos = torch.nn.functional.cosine_similarity(out.flatten(), ref.flatten(), dim=0).item()
+                    worst_rel, worst_cos = max(worst_rel, rel), min(worst_cos, cos)
+                    share = min(share, ((ref - base).norm() / ref.norm()).item())
+    finally:
+        _MERGE_ON[0] = False
+        dit.set_lora_mix_step(0)
+    if not (worst_rel < 0.02 and worst_cos > 0.9998):
+        raise RuntimeError(f"self-test mismatch: rel err {worst_rel:.4f}, cosine {worst_cos:.6f}")
+    return (f"{len(wrapped)} layers, self-test rel err {worst_rel:.4f}, cosine {worst_cos:.6f}, "
+            f"add-on share of the output >= {share:.3f}")
 
 
 # Developer profiling (`profile` input): one continuation segment under torch.profiler,
@@ -951,6 +1058,20 @@ class Runner(BaseRunner):
         except Exception as exc:  # noqa: BLE001 - the input then runs in bf16
             self.unavailable["fp8_matmuls"] = repr(exc)
             print(f"[setup] FP8 matmuls unavailable ({exc!r}); requests run in bf16")
+        self.merge_available = False
+        self.merge_calls = [0]
+        branch_factory = dit._create_multi_lora_forward
+        try:
+            dit._create_multi_lora_forward = _make_merging_factory(branch_factory, self.merge_calls)
+            dit.enable_lora_mix("dmd", "opsd", 1.0, 4)  # rebuild the wrapped forwards through it
+            note = _merge_self_test(dit)
+            self.merge_available = True
+            print(f"[setup] merged add-ons available ({note})")
+        except Exception as exc:  # noqa: BLE001 - requests then use LongCat's branches
+            dit._create_multi_lora_forward = branch_factory
+            dit.enable_lora_mix("dmd", "opsd", 1.0, 4)
+            self.unavailable["merge_lora"] = repr(exc)
+            print(f"[setup] merged add-ons unavailable ({exc!r}); requests use separate branches")
         self.sage = _SageAttention()
         if self.attention in ("fa3", "sdpa"):  # Sage plugs into LongCat's FA3 code path
             try:
@@ -1076,6 +1197,14 @@ class Runner(BaseRunner):
             ge=0.0,
             le=0.9375,
         ),
+        merge_lora: bool = Input(
+            description=(
+                "Fold the LoRA add-ons into each layer's weights just before it multiplies (one "
+                "matrix multiply instead of a separate add-on branch). Faster; the video matches "
+                "the separate-branch path up to rounding. Turn off for LongCat's original path."
+            ),
+            default=True,
+        ),
         fp8_matmuls: bool = Input(
             description=(
                 "Experimental speed-up: run the video model's big matrix multiplies in FP8 (8-bit) on "
@@ -1112,6 +1241,9 @@ class Runner(BaseRunner):
         fp8_on = bool(fp8_matmuls) and self.fp8_available
         _FP8_ON[0] = fp8_on
         self.fp8_calls[0] = 0
+        merge_on = bool(merge_lora) and self.merge_available
+        _MERGE_ON[0] = merge_on
+        self.merge_calls[0] = 0
         torch.cuda.reset_peak_memory_stats()
         if fp8_matmuls and not fp8_on:
             print(f"[predict] FP8 matmuls are unavailable on this machine "
@@ -1120,7 +1252,11 @@ class Runner(BaseRunner):
         print(f"[predict] seed={seed} attention={self.attention}"
               + (f" sparse={sparse_attention}" if sparse_on else "")
               + (" sage=on" if sage_on else "")
-              + (" fp8=on" if fp8_on else ""))
+              + (" fp8=on" if fp8_on else "")
+              + (" merge=on" if merge_on else " merge=off"))
+        if merge_lora and not merge_on:
+            print(f"[predict] merged add-ons are unavailable on this machine "
+                  f"({self.unavailable.get('merge_lora', '?')}); using separate branches")
         if sage_attention and not sage_on:
             print(f"[predict] SageAttention is unavailable on this machine "
                   f"({self.unavailable.get('sage_attention', '?')}); running without it")
@@ -1319,6 +1455,8 @@ class Runner(BaseRunner):
                 print(f"[predict] SageAttention: {self.sage.calls} attention calls")
             if fp8_on:
                 print(f"[predict] FP8 matmuls: {self.fp8_calls[0]} calls")
+            if merge_on:
+                print(f"[predict] merged add-ons: {self.merge_calls[0]} layer calls")
             print(f"[predict] peak GPU memory {torch.cuda.max_memory_allocated() / 1e9:.1f} GB")
             if sparse_on:
                 print(f"[predict] sparse attention: {self.sparse.calls['sparse']} sparse / "
@@ -1328,6 +1466,7 @@ class Runner(BaseRunner):
         finally:
             _DENSE_OVERRIDE[0] = None
             _FP8_ON[0] = False
+            _MERGE_ON[0] = False
             self.sparse.set(0.0)
             self.kv_cache.release()
             if hasattr(self.pipe, "_clear_cache"):
